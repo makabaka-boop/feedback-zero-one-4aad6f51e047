@@ -1,0 +1,25 @@
+{
+  "schema": {
+    "A": {"arity": 1, "ranks": [0], "key": [0]},
+    "B": {"arity": 2, "ranks": [0, 1], "key": [0, 1]},
+    "R": {"arity": 2, "ranks": [0, 1], "key": [0]}
+  },
+  "facts": [
+    {"rel": "A", "args": ["a"]},
+    {"rel": "B", "args": ["a", "b"]}
+  ],
+  "rules": [
+    {
+      "body": [{"rel": "A", "args": ["x"]}],
+      "head": {"rel": "R", "args": ["x", "y"]}
+    },
+    {
+      "body": [{"rel": "B", "args": ["x", "z"]}],
+      "head": {"rel": "R", "args": ["x", "z"]}
+    }
+  ],
+  "query": {
+    "body": [{"rel": "R", "args": ["x", "y"]}],
+    "project": ["x", "y"]
+  }
+}
