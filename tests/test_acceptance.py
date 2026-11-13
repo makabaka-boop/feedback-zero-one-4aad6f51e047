@@ -20,7 +20,12 @@
 10. 析取方案 alternatives：任务书析取例、不同匹配须选不同方案、
     方案内共享见证、方案见证经键合并触发新匹配、部分方案冲突、
     全部方案冲突、空事实，以及 alternatives 的非法结构/引用/rank
-    定位（零基数组下标）。
+    定位（零基数组下标）；
+11. 封闭关系 closed_relations：任务书封闭例（含删除事实 -> inconsistent）、
+    多候选但无确定取值、共享存在对象的跨关系矛盾、封闭绑定经键合并
+    触发新匹配、禁止逐列拼接（见证必须整体对应一条输入元组）、
+    析取方案部分失效与全部失效、空事实、省略/空数组兼容、非法声明
+    字段路径定位（含零基数组下标），以及 CLI 接入与非法声明保留旧文件。
 """
 
 from __future__ import annotations
@@ -1135,6 +1140,740 @@ class TestCLI(unittest.TestCase):
         err = json.loads(proc.stderr)
         self.assertTrue(err["path"].endswith("rules[0].alternatives"))
         # 旧结果必须原封不动。
+        with open(self.output_path, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh), old_result)
+
+
+class TestClosedRelationsSpecExample(unittest.TestCase):
+    """任务书封闭例：A、C 一元，R 二元，rank [0]/[1]/[0,1]，键均为首列。
+
+    事实 A(a)、C(b)；规则 A(x)->R(x,y)、R(x,y)->C(y)；封闭 C 后
+    查询 R 两列得 [["a","b"]]；删除 C(b) 则 inconsistent。
+    """
+
+    def _payload(self, include_c_fact):
+        facts = [{"rel": "A", "args": ["a"]}]
+        if include_c_fact:
+            facts.append({"rel": "C", "args": ["b"]})
+        return {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                C=(1, [1], [0]),
+                R=(2, [0, 1], [0]),
+            ),
+            "facts": facts,
+            "rules": [
+                {
+                    "body": [{"rel": "A", "args": ["x"]}],
+                    "head": {"rel": "R", "args": ["x", "y"]},
+                },
+                {
+                    "body": [{"rel": "R", "args": ["x", "y"]}],
+                    "head": {"rel": "C", "args": ["y"]},
+                },
+            ],
+            "query": {
+                "body": [{"rel": "R", "args": ["x", "y"]}],
+                "project": ["x", "y"],
+            },
+            "closed_relations": ["C"],
+        }
+
+    def test_closed_relation_pins_existential_to_fact(self):
+        self.assertEqual(
+            solve(self._payload(True)),
+            {"status": "ok", "answers": [["a", "b"]]},
+        )
+
+    def test_deleting_closed_fact_makes_inconsistent(self):
+        self.assertEqual(
+            solve(self._payload(False)), {"status": "inconsistent"}
+        )
+
+    def test_omitted_and_empty_array_keep_relations_open(self):
+        # 省略字段：C 开放，存在对象不绑定 b，R 两列无常量答案。
+        payload = self._payload(True)
+        del payload["closed_relations"]
+        self.assertEqual(solve(payload), {"status": "ok", "answers": []})
+        # 显式空数组与省略等价。
+        payload["closed_relations"] = []
+        self.assertEqual(solve(payload), {"status": "ok", "answers": []})
+
+
+class TestClosedMultipleCandidatesNoDefiniteValue(unittest.TestCase):
+    """多候选但无确定取值：存在对象可取两个封闭事实常量之一。"""
+
+    def _payload(self):
+        return {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                S=(1, [1], [0]),
+                R=(2, [0, 1], [0, 1]),
+            ),
+            "facts": [
+                {"rel": "A", "args": ["a"]},
+                {"rel": "S", "args": ["s1"]},
+                {"rel": "S", "args": ["s2"]},
+            ],
+            "rules": [
+                {
+                    "body": [{"rel": "A", "args": ["x"]}],
+                    "head": {"rel": "R", "args": ["x", "y"]},
+                },
+                {
+                    "body": [{"rel": "R", "args": ["x", "y"]}],
+                    "head": {"rel": "S", "args": ["y"]},
+                },
+            ],
+            "query": {
+                "body": [{"rel": "R", "args": ["x", "y"]}],
+                "project": ["x", "y"],
+            },
+            "closed_relations": ["S"],
+        }
+
+    def test_two_witness_branches_no_definite_pair(self):
+        # y 可为 s1 或 s2，两个合法世界的 R 两列答案不同 -> 无必然元组。
+        self.assertEqual(
+            solve(self._payload()), {"status": "ok", "answers": []}
+        )
+
+    def test_closed_relation_itself_still_exposes_both_facts(self):
+        # 封闭关系 S 的两条事实在每个合法世界都在，查询 S 两值都确定。
+        payload = self._payload()
+        payload["query"] = {
+            "body": [{"rel": "S", "args": ["y"]}],
+            "project": ["y"],
+        }
+        self.assertEqual(
+            solve(payload),
+            {"status": "ok", "answers": [["s1"], ["s2"]]},
+        )
+
+    def test_first_column_still_certain(self):
+        payload = self._payload()
+        payload["query"]["project"] = ["x"]
+        self.assertEqual(
+            solve(payload), {"status": "ok", "answers": [["a"]]}
+        )
+
+
+class TestClosedCrossRelationContradiction(unittest.TestCase):
+    """共享存在对象进入两个封闭关系，各自只允许不同常量 -> 矛盾。"""
+
+    def _payload(self, p_fact, q_fact, closed):
+        return {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                P=(1, [1], [0]),
+                Q=(1, [1], [0]),
+                R=(2, [0, 1], [0, 1]),
+            ),
+            "facts": [
+                {"rel": "A", "args": ["a"]},
+                {"rel": "P", "args": [p_fact]},
+                {"rel": "Q", "args": [q_fact]},
+            ],
+            "rules": [
+                {
+                    "body": [{"rel": "A", "args": ["x"]}],
+                    "head": {"rel": "R", "args": ["x", "y"]},
+                },
+                {
+                    "body": [{"rel": "R", "args": ["x", "y"]}],
+                    "head": {"rel": "P", "args": ["y"]},
+                },
+                {
+                    "body": [{"rel": "R", "args": ["x", "y"]}],
+                    "head": {"rel": "Q", "args": ["y"]},
+                },
+            ],
+            "query": {
+                "body": [{"rel": "R", "args": ["x", "y"]}],
+                "project": ["x"],
+            },
+            "closed_relations": closed,
+        }
+
+    def test_same_witness_forced_to_two_distinct_constants(self):
+        payload = self._payload("p", "q", ["P", "Q"])
+        self.assertEqual(solve(payload), {"status": "inconsistent"})
+
+    def test_shared_constant_is_consistent(self):
+        # 两个封闭关系都允许同一常量 p -> 同一见证绑定，自洽。
+        payload = self._payload("p", "p", ["P", "Q"])
+        self.assertEqual(
+            solve(payload), {"status": "ok", "answers": [["a"]]}
+        )
+
+    def test_opening_one_relation_removes_contradiction(self):
+        # 只封闭 P：Q 开放可自由扩充匿名 y，不再有矛盾。
+        payload = self._payload("p", "q", ["P"])
+        self.assertEqual(
+            solve(payload), {"status": "ok", "answers": [["a"]]}
+        )
+
+
+class TestClosedMergeTriggersMatch(unittest.TestCase):
+    """封闭关系把存在对象绑定为常量，合并后触发另一条规则的新连接。"""
+
+    def test_binding_propagates_into_join(self):
+        payload = {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                C=(1, [1], [0]),
+                K=(2, [0, 1], [0, 1]),
+                R=(2, [0, 1], [0]),
+                T=(2, [1, 1], [0, 1]),
+            ),
+            "facts": [
+                {"rel": "A", "args": ["a"]},
+                {"rel": "C", "args": ["c"]},
+                {"rel": "K", "args": ["a", "k"]},
+            ],
+            "rules": [
+                # R(a, 匿名 y)
+                {
+                    "body": [{"rel": "A", "args": ["x"]}],
+                    "head": {"rel": "R", "args": ["x", "y"]},
+                },
+                # 封闭 C 只含 c -> y 必须绑定 c
+                {
+                    "body": [{"rel": "R", "args": ["x", "y"]}],
+                    "head": {"rel": "C", "args": ["y"]},
+                },
+                # 合并后 R(a,c) 与 K(a,k) 连接 -> T(c,k)
+                {
+                    "body": [
+                        {"rel": "R", "args": ["x", "y"]},
+                        {"rel": "K", "args": ["x", "z"]},
+                    ],
+                    "head": {"rel": "T", "args": ["y", "z"]},
+                },
+            ],
+            "query": {
+                "body": [{"rel": "T", "args": ["y", "z"]}],
+                "project": ["y", "z"],
+            },
+            "closed_relations": ["C"],
+        }
+        self.assertEqual(
+            solve(payload), {"status": "ok", "answers": [["c", "k"]]}
+        )
+
+
+class TestClosedWholeTupleWitness(unittest.TestCase):
+    """封闭关系中的匿名元组必须整体对应一条输入元组，禁止逐列拼接。"""
+
+    def _payload(self, add_k=False, add_spliced_fact=False):
+        facts = [
+            {"rel": "A", "args": ["a"]},
+            {"rel": "F", "args": ["p", "1"]},
+            {"rel": "F", "args": ["q", "2"]},
+            {"rel": "G", "args": ["q"]},
+        ]
+        closed = ["F", "G"]
+        rules = [
+            # 开放 H 承载同一对存在对象 (u, v)
+            {
+                "body": [{"rel": "A", "args": ["x"]}],
+                "head": {"rel": "H", "args": ["u", "v"]},
+            },
+            # H->封闭 F：(u,v) 必须整体等于 F 的某条事实行
+            {
+                "body": [{"rel": "H", "args": ["u", "v"]}],
+                "head": {"rel": "F", "args": ["u", "v"]},
+            },
+            # 封闭 G 只含 q -> u=q，整体候选只剩 F(q,2)
+            {
+                "body": [{"rel": "H", "args": ["u", "v"]}],
+                "head": {"rel": "G", "args": ["u"]},
+            },
+        ]
+        if add_k:
+            facts.append({"rel": "K", "args": ["1"]})
+            closed.append("K")
+            # 封闭 K 只含 1 -> v=1；与 u=q 联立要求 F 存在 (q,1) 整体行
+            rules.append(
+                {
+                    "body": [{"rel": "H", "args": ["u", "v"]}],
+                    "head": {"rel": "K", "args": ["v"]},
+                }
+            )
+        if add_spliced_fact:
+            facts.append({"rel": "F", "args": ["q", "1"]})
+        return {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                H=(2, [1, 2], [0, 1]),
+                F=(2, [1, 2], [0, 1]),
+                G=(1, [1], [0]),
+                K=(1, [2], [0]),
+            ),
+            "facts": facts,
+            "rules": rules,
+            "query": {
+                "body": [{"rel": "H", "args": ["u", "v"]}],
+                "project": ["u", "v"],
+            },
+            "closed_relations": closed,
+        }
+
+    def test_witness_matches_one_whole_input_tuple(self):
+        self.assertEqual(
+            solve(self._payload()),
+            {"status": "ok", "answers": [["q", "2"]]},
+        )
+
+    def test_column_wise_splicing_is_rejected(self):
+        # u=q（来自第 2 行）与 v=1（来自第 1 行）的拼接不是任何整体行，
+        # 禁止逐列拼接 -> 没有合法世界。
+        self.assertEqual(
+            solve(self._payload(add_k=True)),
+            {"status": "inconsistent"},
+        )
+
+    def test_adding_the_whole_row_restores_consistency(self):
+        # 补上整体行 F(q,1) 后同一组约束自洽，H 见证确定为 (q,1)。
+        self.assertEqual(
+            solve(self._payload(add_k=True, add_spliced_fact=True)),
+            {"status": "ok", "answers": [["q", "1"]]},
+        )
+
+
+class TestClosedSkolemBranchIsolation(unittest.TestCase):
+    """多候选封闭分裂后，各分支的 Skolem 存在对象必须相互隔离。
+
+    确定性规则经 Skolem 缓存复用同一组空对象；封闭关系多候选分裂时，
+    若子分支原样共享缓存中的空对象 id，一个分支把它绑定到常量 p 后，
+    另一分支再要求它等于 q 就会产生跨分支的伪常量冲突，错误地判
+    inconsistent。这里回归该问题：两个封闭事实行的首列都在另一个封闭
+    关系中时，两个见证分支都应存活。
+    """
+
+    def _payload(self):
+        return {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                F=(2, [1, 2], [0, 1]),
+                G=(1, [1], [0]),
+                H=(2, [1, 2], [0, 1]),
+            ),
+            "facts": [
+                {"rel": "A", "args": ["a"]},
+                {"rel": "F", "args": ["q", "2"]},
+                {"rel": "F", "args": ["p", "1"]},
+                {"rel": "G", "args": ["q"]},
+                {"rel": "G", "args": ["p"]},
+            ],
+            "rules": [
+                # 造全匿名 H(y,z)，Skolem 缓存键为空元组，最易触发共享
+                {
+                    "body": [{"rel": "A", "args": ["x"]}],
+                    "head": {"rel": "H", "args": ["y", "z"]},
+                },
+                # H 进封闭 F：两个整体候选 -> 分裂
+                {
+                    "body": [{"rel": "H", "args": ["y", "z"]}],
+                    "head": {"rel": "F", "args": ["y", "z"]},
+                },
+                # 两个候选首列 q、p 都在封闭 G 中 -> 两分支都应存活
+                {
+                    "body": [{"rel": "F", "args": ["y", "z"]}],
+                    "head": {"rel": "G", "args": ["y"]},
+                },
+            ],
+            "query": {
+                "body": [{"rel": "H", "args": ["y", "z"]}],
+                "project": ["y", "z"],
+            },
+            "closed_relations": ["F", "G"],
+        }
+
+    def test_two_witness_branches_both_survive(self):
+        # 两分支见证不同（(q,2) 与 (p,1)），H 无共同的确定两列答案。
+        self.assertEqual(
+            solve(self._payload()), {"status": "ok", "answers": []}
+        )
+
+    def test_closed_relation_facts_remain_certain(self):
+        payload = self._payload()
+        payload["query"] = {
+            "body": [{"rel": "F", "args": ["y", "z"]}],
+            "project": ["y", "z"],
+        }
+        self.assertEqual(
+            solve(payload),
+            {"status": "ok", "answers": [["p", "1"], ["q", "2"]]},
+        )
+
+    def test_restricting_one_witness_pins_the_other(self):
+        # 去掉 (p,1) 见证与 G(p)：F 只剩 (q,2) 一个整体候选，H 被钉为
+        # 该值。注意 F 的输入事实行本身也会触发 F->G，因此两行要一起
+        # 移除，否则残留的 F(p,1) 仍会要求封闭 G 含 p。
+        payload = self._payload()
+        payload["facts"] = [
+            f for f in payload["facts"]
+            if not (
+                (f["rel"] == "G" and f["args"] == ["p"])
+                or (f["rel"] == "F" and f["args"] == ["p", "1"])
+            )
+        ]
+        self.assertEqual(
+            solve(payload),
+            {"status": "ok", "answers": [["q", "2"]]},
+        )
+
+
+class TestClosedAlternativeAtomicExpansion(unittest.TestCase):
+    """方案内含封闭关系原子时必须一次性展开，避免同一绑定反复分裂。
+
+    旧实现按原子顺序物化方案，封闭原子多候选会在中途挂起，使排在
+    后面的开放原子永远写不进去、方案永远不满足，导致同一
+    ``(规则, 绑定)`` 被反复分裂、反复造空对象而不终止。这里用带
+    看门狗的求解回归该问题。
+    """
+
+    def setUp(self):
+        import signal
+
+        def _handler(signum, frame):
+            raise AssertionError("方案展开未终止：封闭原子重复分裂")
+
+        self._handler = _handler
+        signal.signal(signal.SIGALRM, _handler)
+        signal.alarm(15)
+        self.addCleanup(signal.alarm, 0)
+
+    def test_multi_candidate_closed_atom_with_open_atom(self):
+        payload = {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                S=(1, [1], [0]),
+                R=(2, [0, 1], [0, 1]),
+            ),
+            "facts": [
+                {"rel": "A", "args": ["a"]},
+                {"rel": "S", "args": ["s1"]},
+                {"rel": "S", "args": ["s2"]},
+            ],
+            "rules": [
+                {
+                    "body": [{"rel": "A", "args": ["x"]}],
+                    "alternatives": [
+                        [
+                            {"rel": "R", "args": ["x", "z"]},
+                            {"rel": "S", "args": ["z"]},
+                        ]
+                    ],
+                }
+            ],
+            "query": {
+                "body": [{"rel": "R", "args": ["x", "z"]}],
+                "project": ["x", "z"],
+            },
+            "closed_relations": ["S"],
+        }
+        # z 可取 s1 或 s2，两个分支的两列答案不同 -> 无必然元组。
+        self.assertEqual(
+            solve(payload), {"status": "ok", "answers": []}
+        )
+        # 只投影首列：两个分支都含 R(a,·)，a 确定。
+        payload["query"]["project"] = ["x"]
+        self.assertEqual(
+            solve(payload), {"status": "ok", "answers": [["a"]]}
+        )
+
+    def test_two_closed_atoms_cartesian_product_empty_intersection(self):
+        # 同一方案两个封闭原子：候选取笛卡尔积，交集为空时整体失效。
+        payload = {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                S=(1, [1], [0]),
+                T=(1, [1], [0]),
+                R=(2, [0, 1], [0, 1]),
+            ),
+            "facts": [
+                {"rel": "A", "args": ["a"]},
+                {"rel": "S", "args": ["s1"]},
+                {"rel": "S", "args": ["s2"]},
+                {"rel": "T", "args": ["t1"]},
+            ],
+            "rules": [
+                {
+                    "body": [{"rel": "A", "args": ["x"]}],
+                    "alternatives": [
+                        [
+                            {"rel": "R", "args": ["x", "z"]},
+                            {"rel": "S", "args": ["z"]},
+                            {"rel": "T", "args": ["z"]},
+                        ]
+                    ],
+                }
+            ],
+            "query": {
+                "body": [{"rel": "R", "args": ["x", "z"]}],
+                "project": ["x"],
+            },
+            "closed_relations": ["S", "T"],
+        }
+        # T 只允许 t1，S 无 t1 -> 无自洽见证组合 -> inconsistent。
+        self.assertEqual(solve(payload), {"status": "inconsistent"})
+        # 给 S 补上整体见证 t1 后自洽。
+        payload["facts"].append({"rel": "S", "args": ["t1"]})
+        self.assertEqual(
+            solve(payload), {"status": "ok", "answers": [["a"]]}
+        )
+
+
+class TestClosedAlternativesPartialFailure(unittest.TestCase):
+    """析取方案部分失效：封闭关系无见证的方案被丢弃，其余方案仍存活。"""
+
+    def _payload(self, closed):
+        return {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                B=(1, [0], [0]),
+                R=(2, [0, 1], [0, 1]),
+            ),
+            "facts": [
+                {"rel": "A", "args": ["a"]},
+                {"rel": "B", "args": ["m"]},
+            ],
+            "rules": [
+                {
+                    "body": [{"rel": "A", "args": ["x"]}],
+                    "alternatives": [
+                        [{"rel": "B", "args": ["x"]}],
+                        [{"rel": "R", "args": ["x", "z"]}],
+                    ],
+                }
+            ],
+            "query": {
+                "body": [{"rel": "R", "args": ["x", "z"]}],
+                "project": ["x"],
+            },
+            "closed_relations": closed,
+        }
+
+    def test_witnessless_alternative_is_dropped_not_fatal(self):
+        # 封闭 B 只含 m：方案 B(a) 无见证被丢弃；方案 R(a,z) 开放可存活。
+        self.assertEqual(
+            solve(self._payload(["B"])),
+            {"status": "ok", "answers": [["a"]]},
+        )
+
+    def test_all_alternatives_witnessless_is_inconsistent(self):
+        # R 也封闭且无任何 R 事实 -> 两个方案都无见证 -> 无合法世界。
+        self.assertEqual(
+            solve(self._payload(["B", "R"])),
+            {"status": "inconsistent"},
+        )
+
+    def test_open_relation_keeps_both_branches(self):
+        # 不封闭：两分支都存活，R 只在其一成立 -> 无必然答案。
+        self.assertEqual(
+            solve(self._payload([])), {"status": "ok", "answers": []}
+        )
+
+
+class TestClosedEmptyFacts(unittest.TestCase):
+    def test_closed_relation_with_empty_facts_is_legal_when_unused(self):
+        # 空事实：没有 body 匹配，规则不触发；封闭关系外延为空合法。
+        payload = {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                C=(1, [1], [0]),
+                R=(2, [0, 1], [0]),
+            ),
+            "facts": [],
+            "rules": [
+                {
+                    "body": [{"rel": "A", "args": ["x"]}],
+                    "head": {"rel": "R", "args": ["x", "y"]},
+                },
+                {
+                    "body": [{"rel": "R", "args": ["x", "y"]}],
+                    "head": {"rel": "C", "args": ["y"]},
+                },
+            ],
+            "query": {
+                "body": [{"rel": "C", "args": ["y"]}],
+                "project": ["y"],
+            },
+            "closed_relations": ["C"],
+        }
+        self.assertEqual(solve(payload), {"status": "ok", "answers": []})
+
+    def test_derivation_into_empty_closed_relation_is_inconsistent(self):
+        # 有 A(a) 触发规则，但封闭 C 事实为空 -> 无见证 -> inconsistent。
+        payload = {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                C=(1, [1], [0]),
+                R=(2, [0, 1], [0]),
+            ),
+            "facts": [{"rel": "A", "args": ["a"]}],
+            "rules": [
+                {
+                    "body": [{"rel": "A", "args": ["x"]}],
+                    "head": {"rel": "R", "args": ["x", "y"]},
+                },
+                {
+                    "body": [{"rel": "R", "args": ["x", "y"]}],
+                    "head": {"rel": "C", "args": ["y"]},
+                },
+            ],
+            "query": {
+                "body": [{"rel": "C", "args": ["y"]}],
+                "project": ["y"],
+            },
+            "closed_relations": ["C"],
+        }
+        self.assertEqual(solve(payload), {"status": "inconsistent"})
+
+
+class TestClosedRelationsValidation(unittest.TestCase):
+    """closed_relations 的非法声明定位（含零基数组下标）与兼容形态。"""
+
+    def _base(self):
+        return {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                R=(2, [0, 1], [0]),
+            ),
+            "facts": [{"rel": "A", "args": ["a"]}],
+            "rules": [
+                {
+                    "body": [{"rel": "A", "args": ["x"]}],
+                    "head": {"rel": "R", "args": ["x", "y"]},
+                }
+            ],
+            "query": {
+                "body": [{"rel": "R", "args": ["x", "y"]}],
+                "project": ["x"],
+            },
+        }
+
+    def assertRejects(self, payload, path_suffix):
+        with self.assertRaises(ValidationError) as ctx:
+            solve(payload)
+        self.assertTrue(
+            ctx.exception.path.endswith(path_suffix),
+            f"路径 {ctx.exception.path!r} 应以 {path_suffix!r} 结尾",
+        )
+
+    def test_field_must_be_array(self):
+        p = self._base()
+        p["closed_relations"] = "C"
+        self.assertRejects(p, "closed_relations")
+
+    def test_empty_array_is_legal(self):
+        p = self._base()
+        p["closed_relations"] = []
+        self.assertEqual(solve(p)["status"], "ok")
+
+    def test_omitted_field_is_legal(self):
+        self.assertEqual(solve(self._base())["status"], "ok")
+
+    def test_unknown_relation_located_at_index(self):
+        p = self._base()
+        p["closed_relations"] = ["Ghost"]
+        self.assertRejects(p, "closed_relations[0]")
+
+    def test_duplicate_relation_located_at_second_index(self):
+        p = self._base()
+        p["closed_relations"] = ["A", "A"]
+        self.assertRejects(p, "closed_relations[1]")
+
+    def test_non_name_entries_located_at_index(self):
+        for bad in (123, True, "", "关系"):
+            p = self._base()
+            p["closed_relations"] = [bad]
+            self.assertRejects(p, "closed_relations[0]")
+
+    def test_extra_top_level_field_still_rejected(self):
+        p = self._base()
+        p["unexpected"] = []
+        self.assertRejects(p, "unexpected")
+
+
+class TestClosedRelationsCLI(unittest.TestCase):
+    """原文件入口接入 closed_relations；非法声明整次拒绝并保留旧文件。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="chase-closed-")
+        self.input_path = os.path.join(self.tmp, "in.json")
+        self.output_path = os.path.join(self.tmp, "out.json")
+
+    def _run_cli(self):
+        proc = subprocess.run(
+            [sys.executable, "-m", "chase_backend",
+             self.input_path, self.output_path],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        return proc
+
+    def test_closed_relation_example_runs_through_cli(self):
+        payload = {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                C=(1, [1], [0]),
+                R=(2, [0, 1], [0]),
+            ),
+            "facts": [
+                {"rel": "A", "args": ["a"]},
+                {"rel": "C", "args": ["b"]},
+            ],
+            "rules": [
+                {
+                    "body": [{"rel": "A", "args": ["x"]}],
+                    "head": {"rel": "R", "args": ["x", "y"]},
+                },
+                {
+                    "body": [{"rel": "R", "args": ["x", "y"]}],
+                    "head": {"rel": "C", "args": ["y"]},
+                },
+            ],
+            "query": {
+                "body": [{"rel": "R", "args": ["x", "y"]}],
+                "project": ["x", "y"],
+            },
+            "closed_relations": ["C"],
+        }
+        with open(self.input_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False)
+        proc = self._run_cli()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(self.output_path, encoding="utf-8") as fh:
+            self.assertEqual(
+                json.load(fh),
+                {"status": "ok", "answers": [["a", "b"]]},
+            )
+
+    def test_invalid_closed_declaration_keeps_old_output(self):
+        old_result = {"status": "ok", "answers": [["OLD"]]}
+        atomic_write_json(self.output_path, old_result)
+        bad = {
+            "schema": _schema_r(A=(1, [0], [0])),
+            "facts": [{"rel": "A", "args": ["a"]}],
+            "rules": [],
+            "query": {
+                "body": [{"rel": "A", "args": ["x"]}],
+                "project": ["x"],
+            },
+            "closed_relations": ["Ghost"],
+        }
+        with open(self.input_path, "w", encoding="utf-8") as fh:
+            json.dump(bad, fh, ensure_ascii=False)
+        proc = self._run_cli()
+        self.assertNotEqual(proc.returncode, 0)
+        err = json.loads(proc.stderr)
+        self.assertTrue(
+            err["path"].endswith("closed_relations[0]")
+        )
         with open(self.output_path, encoding="utf-8") as fh:
             self.assertEqual(json.load(fh), old_result)
 

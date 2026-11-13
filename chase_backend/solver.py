@@ -23,7 +23,12 @@ def solve(payload: Any) -> dict:
     由调用方负责整次拒绝并保留旧输出。
     """
     problem = validate(payload)
-    branches = chase_all(problem["schema"], problem["facts"], problem["rules"])
+    branches = chase_all(
+        problem["schema"],
+        problem["facts"],
+        problem["rules"],
+        problem["closed_relations"],
+    )
     if not branches:
         return {"status": "inconsistent"}
     # 必然答案 = 各存活分支常量答案的交集。

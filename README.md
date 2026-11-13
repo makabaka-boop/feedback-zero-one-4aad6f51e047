@@ -13,17 +13,19 @@
 │   ├── __init__.py           # 对外 API：solve / 异常类型
 │   ├── __main__.py           # 命令行入口 python -m chase_backend
 │   ├── validator.py          # 完整输入校验（错误带 JSON 字段路径）
-│   ├── engine.py             # chase 引擎：并查集 + Skolem 空对象 + 键合并 + 析取分支
+│   ├── engine.py             # chase 引擎：并查集 + Skolem 空对象 + 键合并 + 析取分支 + 封闭关系见证
 │   ├── solver.py             # 校验 -> chase -> 查询 的编排
 │   ├── io_utils.py           # 原子写入（临时文件 + os.replace）
 │   └── errors.py             # ValidationError / InconsistentError
 ├── tests/
-│   └── test_acceptance.py    # 独立验收（55 项，仅依赖 unittest）
+│   └── test_acceptance.py    # 独立验收（82 项，仅依赖 unittest）
 ├── examples/
 │   ├── spec_example.json                  # 题面示例输入
 │   ├── spec_example.expected.json         # 期望输出
 │   ├── alternatives_example.json          # 析取方案示例输入
-│   └── alternatives_example.expected.json # 期望输出
+│   ├── alternatives_example.expected.json # 期望输出
+│   ├── closed_relations_example.json      # 封闭关系示例输入
+│   └── closed_relations_example.expected.json
 └── README.md
 ```
 
@@ -46,7 +48,8 @@
   "query": {
     "body": [{"rel": "Out", "args": ["x", "z"]}],
     "project": ["x", "z"]
-  }
+  },
+  "closed_relations": ["Rel"]
 }
 ```
 
@@ -71,6 +74,10 @@
     存在变量所在列的 rank 必须严格高于整个 body 所有位置的最高
     rank。
 * **query**：非空 `body` 与非空 `project`，投影变量必须在 body 出现。
+* **closed_relations（可选）**：无重复关系名的数组，**允许空数组**；
+  省略该字段时所有关系保持开放，旧输入完全兼容。每项必须是非空
+  ASCII 字母数字串且引用已在 schema 声明的关系；非法项带零基下标
+  路径（如 `closed_relations[0]`）整次拒绝。
 * 关系引用与元数必须匹配；名称限非空 ASCII 字母数字串，常量为
   Unicode 字符串。
 
@@ -81,7 +88,21 @@
 规则，每个 body 绑定在合法世界中至少有一个方案成立；某个方案选择
 导致键冲突时只排除该选择组合，**不**直接判整题无解——所有选择
 组合都冲突时才不存在合法世界。不同字符串常量永不相等；未知对象
-之间、未知对象与常量之间可以相等。不存在任何合法世界时输出：
+之间、未知对象与常量之间可以相等。
+
+**封闭关系**（`closed_relations` 中声明的关系）在合法世界中的外延
+必须**恰等于**输入 facts 中该关系去重后的元组集合，不能补造任何
+记录；其余关系仍按上面的开放语义处理。规则向封闭关系推导出的每条
+元组都必须能**整体**对应某条输入事实元组（常量列逐列相等，匿名列
+绑定到对应事实列常量），禁止把不同事实行的列逐列拼接：
+
+* 没有可对应的事实行 -> 该选择组合不可满足；
+* 恰有一个候选 -> 匿名对象绑定常量，推导元组与事实行重合；
+* 多个候选 -> 按候选分裂，与析取方案共用同一套分支枚举。
+
+同一对象在全部位置取值一致：不同匹配对同一匿名对象的绑定经并查集
+统一，要求它等于两个不同常量时该分支冲突；选择引发的新规则匹配与
+键合并仍须满足全部声明。不存在任何合法世界时输出：
 
 ```json
 {"status": "inconsistent"}
@@ -130,6 +151,18 @@
   **必然答案 = 各存活分支常量答案的交集**；
 * 方案一旦满足便不会被撤销（键合并与新增元组只增不减匹配），每个
   `(规则, 绑定)` 至多分裂一次，分裂点总数有限，分支树有限。
+
+### 封闭关系的 chase 处理
+
+封闭关系在初始化时即由输入事实填满，推导只做**见证匹配**而不写入
+新元组。一条推导元组进入封闭关系时，逐条比对该关系的输入事实行：
+常量列必须逐列相等，匿名列在该候选行下要求等于对应事实列常量（同一
+匿名对象在本行多列出现时必须指向同一常量）。无候选 -> 分支冲突；
+唯一候选 -> 经并查集把匿名对象绑定到常量，后续规则匹配与键合并照常
+级联；多候选 -> 记录挂起点并按候选事实行分裂子分支，与析取方案的
+分裂共用同一个分支栈。因为见证按整条元组匹配，逐列拼接天然不可能
+发生；不同候选对同一匿名对象要求不同常量时，由并查集的常量冲突
+检查淘汰对应分支。
 
 ### 终止性（rank 归纳）
 
@@ -183,7 +216,7 @@ python -I tests/test_acceptance.py
 python -m unittest discover -s tests -t .
 ```
 
-覆盖场景（55 项）：
+覆盖场景（82 项）：
 
 * 题面示例（缺关联对象经键合并补回必然答案）及无确定答案对照组；
 * 递归：传递闭包、带环图终止与去重；
@@ -200,5 +233,11 @@ python -m unittest discover -s tests -t .
   不在 body、缺字段/多字段，以及 alternatives 非空数组/非空方案
   数组/与 head 互斥/方案内引用与 rank 定位到零基数组下标等）并
   整次拒绝；
+* 封闭关系 closed_relations：任务书封闭例（删除封闭事实 ->
+  inconsistent）、多候选但无确定取值、共享存在对象的跨关系矛盾、
+  封闭绑定经键合并触发新匹配、匿名元组整体对应（禁止逐列拼接）、
+  析取方案部分失效与全部失效、空事实、省略/空数组兼容、非法声明
+  定位到字段路径与零基数组下标；
 * CLI：成功原子替换、非法输入保留旧输出、`inconsistent` 正常落盘、
-  输入缺失时不产生输出、alternatives 输入正常求解。
+  输入缺失时不产生输出、alternatives 与 closed_relations 输入正常求解、
+  非法 closed_relations 声明保留旧文件。

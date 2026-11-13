@@ -24,7 +24,9 @@ from typing import Any
 from .errors import ValidationError
 
 # 允许出现的 ASCII 字母数字字符（名称内部使用 isascii/isalnum 判定）。
-_TOP_LEVEL_KEYS = {"schema", "facts", "rules", "query"}
+_TOP_LEVEL_KEYS = {
+    "schema", "facts", "rules", "query", "closed_relations"
+}
 _SCHEMA_KEYS = {"arity", "ranks", "key"}
 _ATOM_KEYS = {"rel", "args"}
 _RULE_KEYS = {"body", "head", "alternatives"}
@@ -288,6 +290,40 @@ def _check_query(raw_query: Any, schema: dict) -> dict:
     return {"body": [dict(a) for a in body], "project": list(project)}
 
 
+def _check_closed_relations(raw: Any, schema: dict) -> list[str]:
+    """校验可选的 ``closed_relations``：无重复关系名的数组，允许空数组。
+
+    省略该字段时返回空列表（全部关系保持开放，兼容旧输入）；出现时
+    必须是数组，每项为非空 ASCII 字母数字串、引用已声明的关系，且
+    数组内部不得重复。任何一处非法都带 JSON 路径抛出
+    :class:`ValidationError`（数组下标零基）。
+    """
+    if raw is None:
+        return []
+    path = "$.closed_relations"
+    if not isinstance(raw, list):
+        raise ValidationError("closed_relations 必须是数组", path)
+    closed: list[str] = []
+    seen: set[str] = set()
+    for i, name in enumerate(raw):
+        item_path = f"{path}[{i}]"
+        if not _is_name(name):
+            raise ValidationError(
+                "封闭关系名必须是非空 ASCII 字母数字串", item_path
+            )
+        if name not in schema:
+            raise ValidationError(
+                f"关系 {name!r} 未在 schema 中声明", item_path
+            )
+        if name in seen:
+            raise ValidationError(
+                f"封闭关系 {name!r} 重复声明", item_path
+            )
+        seen.add(name)
+        closed.append(name)
+    return closed
+
+
 def validate(payload: Any) -> dict:
     """校验完整输入，返回规范化后的内部结构。"""
     root = _require_object(payload, "$", "输入")
@@ -297,6 +333,10 @@ def validate(payload: Any) -> dict:
             raise ValidationError(f"输入缺少顶层字段 {field}", f"$.{field}")
 
     schema = _check_schema(root["schema"])
+    # closed_relations 引用 schema 中的关系，须在 schema 之后、facts 之前校验。
+    closed_relations = _check_closed_relations(
+        root.get("closed_relations"), schema
+    )
 
     raw_facts = root["facts"]
     if not isinstance(raw_facts, list):
@@ -309,4 +349,10 @@ def validate(payload: Any) -> dict:
     rules = _check_rules(root["rules"], schema)
     query = _check_query(root["query"], schema)
 
-    return {"schema": schema, "facts": facts, "rules": rules, "query": query}
+    return {
+        "schema": schema,
+        "facts": facts,
+        "rules": rules,
+        "query": query,
+        "closed_relations": closed_relations,
+    }

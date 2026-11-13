@@ -1,4 +1,4 @@
-"""chase 推理引擎（确定性 head 规则 + 析取 alternatives 规则）。
+"""chase 推理引擎（确定性 head 规则 + 析取 alternatives 规则 + 封闭关系）。
 
 语义
 ----
@@ -26,17 +26,32 @@
 * 两个不同的字符串常量：不同字符串常量永不相等，当前分支不可满足，
   抛出 :class:`InconsistentError`。
 
+封闭关系（closed_relations）
+----------------------------
+声明为封闭的关系，其在任何合法世界中的外延必须**恰等于**输入 facts
+中该关系去重后的元组集合（其余关系仍可自由扩充）：
+
+* 初始化时输入事实即封闭关系的全部内容，天然满足；
+* 规则向封闭关系推导出的每条元组都必须能**整体**对应某条输入事实
+  元组：常量列逐列相等；匿名列（存在对象）在匹配中绑定到对应事实列
+  的常量——禁止逐列拼接，即不能把不同事实行的列拼成一条匹配；
+* 同一对象在全部位置取值一致：不同匹配对同一匿名对象的绑定经并查集
+  统一，绑定到不同常量即触发常量冲突；
+* 没有任何可匹配的事实行 -> 当前分支不可满足；恰有一个候选 -> 匿名
+  对象绑定常量后推导元组与事实行重合，不写入新元组；多个候选 -> 按
+  候选分裂子分支（与析取方案共用同一套分支栈）。
+
 析取 chase
 ----------
-单分支内先把确定性规则与键合并追到不动点；随后取一个尚未满足任何
-方案的 ``(析取规则, body 绑定)``，按方案分裂子分支，每个子分支加入
-对应方案的原子（存在变量取全新空对象）再各自收敛。导致常量冲突的
-分支被丢弃——方案冲突不等于整题无解；全部分支都冲突时才不存在任何
-合法世界。
+单分支内先把确定性规则与键合并追到不动点；封闭关系的多候选匹配与
+尚未满足任何方案的 ``(析取规则, body 绑定)`` 都表现为分裂点：前者按
+候选事实行分裂，后者按方案分裂。导致常量冲突的分支被丢弃——单个
+选择冲突不等于整题无解；全部分支都冲突时才不存在任何合法世界。
 
 每个存活分支都是一个合法世界；反过来，任意合法世界都包含某个存活
-分支的同态像（沿该世界实际满足的方案逐次选择即得对应分支路径）。
-因此“所有合法世界共有”的常量查询答案 = 各存活分支常量答案的交集。
+分支的同态像（沿该世界实际满足的方案与封闭关系见证逐次选择即得对应
+分支路径）。因此“所有合法世界共有”的常量查询答案 = 各存活分支常量
+答案的交集。
 
 终止性
 ------
@@ -45,8 +60,9 @@ rank 安全（逐原子沿用：共有变量目标列 rank 不低于其 body 最
 在不低于其“诞生 rank”的位置，空对象只能在严格高于 body 最高 rank
 的位置诞生。按 rank 归纳，每个 rank 层的对象与元组数目有限，键合并
 只减少不同对象数，故每个分支在有限步内收敛。方案一旦满足便不会被
-撤销（合并与新增元组只增不减匹配），每个 (规则, 绑定) 至多分裂一次，
-分裂点总数有限，分支树有限，整体必然终止。
+撤销（合并与新增元组只增不减匹配）；封闭关系只绑定匿名对象、不新增
+元组，每个 (规则, 绑定) 至多分裂一次，分裂点总数有限，分支树有限，
+整体必然终止。
 """
 
 from __future__ import annotations
@@ -57,6 +73,14 @@ from .errors import InconsistentError
 #   常量直接用 ("c", 字符串) 表示；
 #   空对象用 ("n", 整数 id) 表示。
 # 元组存“原始值”，读取时经并查集规范化。
+
+
+class _Suspended(Exception):
+    """内部信号：封闭关系出现多候选见证，需把分支交还外层分裂。
+
+    携带挂起信息 ``(rel, raw_tuple, 候选事实行列表)``；由
+    :func:`chase_all` 捕获后按候选生成子分支。不对外暴露。
+    """
 
 
 class UnionFind:
@@ -117,7 +141,13 @@ class UnionFind:
 class ChaseEngine:
     """一个 chase 分支：并查集 + 实例 + 键索引 + Skolem 缓存。"""
 
-    def __init__(self, schema: dict, facts: list[dict], rules: list[dict]) -> None:
+    def __init__(
+        self,
+        schema: dict,
+        facts: list[dict],
+        rules: list[dict],
+        closed_relations: list[str] | None = None,
+    ) -> None:
         self.schema = schema
         self.rules = rules
         self.uf = UnionFind()
@@ -137,21 +167,38 @@ class ChaseEngine:
             i: {} for i in range(len(rules))
         }
 
+        # 封闭关系：名称集合，以及每个封闭关系的输入事实元组集合
+        # （全部由常量构成，已按集合去重）。封闭关系不允许出现这些
+        # 元组之外的任何元组。
+        self.closed: set[str] = set(closed_relations or ())
+        self.closed_facts: dict[str, set[tuple]] = {
+            rel: set() for rel in self.closed
+        }
+        # 挂起的封闭关系多候选见证：
+        # (rel, 原始推导元组, 候选事实行(常量元组) 列表)，由外层分裂消费。
+        self.pending = None
+
         for fact in facts:
             raw = tuple(("c", c) for c in fact["args"])
             self.instance[fact["rel"]].add(raw)
+            if fact["rel"] in self.closed:
+                self.closed_facts[fact["rel"]].add(raw)
 
     # ------------------------------------------------------------------
     # 分支拷贝
     # ------------------------------------------------------------------
     def clone(self) -> "ChaseEngine":
-        """深拷贝当前分支（分裂子分支用）；schema/rules 为只读共享。"""
+        """深拷贝当前分支（分裂子分支用）；schema/rules/封闭集为只读共享。"""
         other = ChaseEngine.__new__(ChaseEngine)
         other.schema = self.schema
         other.rules = self.rules
         uf = UnionFind()
         uf._parent = dict(self.uf._parent)
         uf._constant = dict(self.uf._constant)
+        # 克隆后可能对从未参与合并的空对象直接做 canon/find（封闭关系
+        # 见证绑定会用到），确保 0.._next_null 内每个 id 都有 parent 条目。
+        for null_id in range(self._next_null):
+            uf._parent.setdefault(null_id, null_id)
         other.uf = uf
         other._next_null = self._next_null
         other.instance = {rel: set(tpls) for rel, tpls in self.instance.items()}
@@ -160,7 +207,67 @@ class ChaseEngine:
             ri: {key: list(ids) for key, ids in cache.items()}
             for ri, cache in self._skolem_cache.items()
         }
+        # 只读结构直接共享；子分支从新分裂点开始，不继承挂起状态。
+        other.closed = self.closed
+        other.closed_facts = self.closed_facts
+        other.pending = None
         return other
+
+    def _remap_nulls_fresh(self, null_ids: set[int]) -> dict[int, int]:
+        """把给定空对象在本分支内替换为全新空对象，返回旧 id -> 新 id。
+
+        封闭关系多候选分裂时，让每个子分支对挂起元组中的存在对象持有
+        **私有的、互不相同的 id**：克隆本身已隔离并查集，相同 id 不会
+        造成跨分支误判，但私有名可彻底避免跨分支的对象别名，使各分支
+        的存在对象身份显式独立、便于推理与排障。重写需同步覆盖并查集、
+        实例原始元组与 Skolem 缓存（含缓存键内嵌的空对象元组）；键索引
+        留待 stabilize() 重建。
+        """
+        if not null_ids:
+            return {}
+        mapping = {nid: self._new_null() for nid in null_ids}
+
+        def remap_value(value: tuple) -> tuple:
+            if value[0] == "n" and value[1] in mapping:
+                return ("n", mapping[value[1]])
+            return value
+
+        # 并查集：新 id 已由 _new_null 建为独立根，迁移旧根的常量绑定。
+        old_roots = {self.uf.find(nid) for nid in null_ids}
+        for old, new in mapping.items():
+            root = self.uf.find(old)
+            const = self.uf._constant.get(root)
+            if const is not None and root in old_roots:
+                self.uf._constant.setdefault(new, const)
+        for root in old_roots:
+            self.uf._constant.pop(root, None)
+        for old in null_ids:
+            self.uf._parent.pop(old, None)
+        # 剔除仍指向已删除 id 的悬挂父指针（等价类已整体迁移）。
+        for nid, parent in list(self.uf._parent.items()):
+            if parent in null_ids and nid not in null_ids:
+                self.uf._parent[nid] = nid
+        # 实例中的原始元组同步替换。
+        for rel, tuples in self.instance.items():
+            rebuilt = set()
+            for raw in tuples:
+                rebuilt.add(tuple(remap_value(v) for v in raw))
+            self.instance[rel] = rebuilt
+        # Skolem 缓存中的 id 列表与缓存键（键内可能嵌着空对象的规范化
+        # 元组）都要同步替换，否则重跑规则会因键失配而另造新对象，
+        # 破坏“同一绑定同一组存在对象”的分支内缓存语义。
+        for cache in self._skolem_cache.values():
+            for key, ids in list(cache.items()):
+                new_key = tuple(
+                    (var, remap_value(val)) for var, val in key
+                )
+                cache[new_key] = [mapping.get(nid, nid) for nid in ids]
+                if new_key != key:
+                    del cache[key]
+        # 索引含旧 id 的规范化条目，整体作废，由下一轮重建恢复。
+        for rel in self.index:
+            self.index[rel] = {}
+        return mapping
 
     # ------------------------------------------------------------------
     # 空对象
@@ -260,8 +367,89 @@ class ChaseEngine:
     # ------------------------------------------------------------------
     # 确定性规则（head）
     # ------------------------------------------------------------------
+    def _closed_candidates(
+        self, rel: str, raw_tuple: tuple
+    ) -> list[tuple]:
+        """求封闭关系推导元组可整体对应的全部输入事实行（见证候选）。
+
+        匹配按**整条元组**进行，禁止逐列拼接：对每条输入事实行，常量列
+        必须与推导元组规范化值逐列相等；推导元组中的匿名对象在该行下
+        被要求等于对应事实列常量。同一匿名对象在本行多次出现时，各列
+        必须指向同一常量，否则该行不是候选。
+
+        候选之间的匿名绑定冲突（同一对象被不同候选要求等于不同常量）
+        在分支选定见证后由并查集的 ``bind_constant`` 暴露为常量冲突。
+        """
+        canon = tuple(self.uf.canon(v) for v in raw_tuple)
+        candidates: list[tuple] = []
+        for fact_tuple in self.closed_facts[rel]:
+            null_to_const: dict[int, str] = {}
+            feasible = True
+            for derived, fact_val in zip(canon, fact_tuple):
+                const = fact_val[1]  # 事实行全部是 ("c", 字符串)
+                if derived[0] == "c":
+                    if derived[1] != const:
+                        feasible = False
+                        break
+                else:
+                    # 匿名对象：本行内多次出现必须指向同一个常量。
+                    bound = null_to_const.setdefault(derived[1], const)
+                    if bound != const:
+                        feasible = False
+                        break
+            if feasible:
+                candidates.append(fact_tuple)
+        return candidates
+
+    def _bind_closed_witness(
+        self, raw_tuple: tuple, fact_tuple: tuple
+    ) -> None:
+        """选定一条见证事实行：把推导元组中的匿名对象绑定到对应常量。"""
+        canon = tuple(self.uf.canon(v) for v in raw_tuple)
+        for derived, fact_val in zip(canon, fact_tuple):
+            if derived[0] == "n":
+                self.uf.bind_constant(derived[1], fact_val[1])
+
+    def _insert_closed(self, rel: str, raw_tuple: tuple) -> bool:
+        """向封闭关系写入推导元组。
+
+        封闭关系的外延被钉死为输入事实集合，因此推导元组不能真正新增：
+
+        * 无候选事实行 -> 违反封闭性，当前分支不可满足；
+        * 唯一候选 -> 匿名对象绑定对应常量，元组与事实行重合（不写入）；
+        * 多个候选 -> 抛出 :class:`_Suspended`，由外层按候选分裂。
+
+        返回值与 :meth:`_insert` 对齐：唯一候选且发生了新绑定时为 True，
+        纯常量重合（无变化）为 False。
+        """
+        candidates = self._closed_candidates(rel, raw_tuple)
+        if not candidates:
+            raise InconsistentError(
+                f"封闭关系 {rel!r} 出现了输入事实之外的元组"
+            )
+        if len(candidates) > 1:
+            self.pending = (rel, raw_tuple, candidates)
+            raise _Suspended(rel)
+        # 唯一候选：绑定前记录哪些匿名列尚未落到常量，绑定后据此判断
+        # 实例是否发生了需要外层重建索引的变化。
+        canon = tuple(self.uf.canon(v) for v in raw_tuple)
+        unbound = {
+            v[1] for v in canon
+            if v[0] == "n"
+            and self.uf._constant.get(self.uf.find(v[1])) is None
+        }
+        self._bind_closed_witness(raw_tuple, candidates[0])
+        newly_bound = any(
+            self.uf._constant.get(self.uf.find(nid)) is not None
+            for nid in unbound
+        )
+        return newly_bound
+
     def _insert(self, rel: str, raw_tuple: tuple) -> bool:
-        """插入一条原始元组并立即做键约束检查。
+        """插入一条原始元组并立即做键约束/封闭关系检查。
+
+        封闭关系走 :meth:`_insert_closed`（多候选时抛 :class:`_Suspended`
+        交外层分裂）；开放关系走原来的键约束逻辑。
 
         返回值表示“是否发生了需要外层重建索引的变化”（新增元组或
         触发等值合并）。
@@ -272,6 +460,8 @@ class ChaseEngine:
         会再次触发（Skolem 缓存保证取回同一组空对象），合并后的元组
         随重建自然进入索引（若仍有差异还会继续合并）。
         """
+        if rel in self.closed:
+            return self._insert_closed(rel, raw_tuple)
         canon = tuple(self.uf.canon(v) for v in raw_tuple)
         key_cols = self.schema[rel]["key"]
         key = tuple(canon[c] for c in key_cols)
@@ -353,14 +543,26 @@ class ChaseEngine:
                     return rule_idx, binding
         return None
 
-    def apply_alternative(self, alt: list[dict], binding: dict) -> None:
-        """把方案原子写入实例：body 变量取绑定值；方案内未在 body 出现
-        的同名变量共享一个全新的 Skolem 空对象（跨方案、跨绑定独立）。
+    def expand_alternative(
+        self, alt: list[dict], binding: dict
+    ) -> list["ChaseEngine"]:
+        """一次性展开一个方案，返回全部自洽的子分支（可能为空）。
 
-        直接写入 instance：键合并留给 stabilize() 的索引重建完成，
-        常量冲突（若有）在子分支收敛时以 InconsistentError 暴露。
+        方案内未在 body 出现的同名变量共享同一组全新 Skolem 空对象
+        （跨方案、跨绑定各自独立）。随后按原子关系类型分流：
+
+        * 开放关系原子：元组直接写入实例，键合并留给子分支 stabilize()；
+        * 封闭关系原子：不允许新增元组，改求可整体对应的输入事实行，
+          按候选分裂（同一方案多个封闭原子取候选的笛卡尔积）；无候选
+          的组合直接丢弃，不产生分支。
+
+        一次性展开保证每个 ``(析取规则, body 绑定)`` 至多分裂一次，
+        不会因封闭原子多候选而重复造空对象；封闭绑定引发的常量冲突
+        在 :meth:`UnionFind.bind_constant` 处就地暴露，对应组合被丢弃。
         """
+        # 1) 用同一组空对象把方案所有原子物化为原始元组。
         assigned: dict[str, int] = {}
+        materialized: list[tuple[str, tuple]] = []
         for atom in alt:
             tpl = []
             for var in atom["args"]:
@@ -370,7 +572,33 @@ class ChaseEngine:
                     if var not in assigned:
                         assigned[var] = self._new_null()
                     tpl.append(("n", assigned[var]))
-            self.instance[atom["rel"]].add(tuple(tpl))
+            materialized.append((atom["rel"], tuple(tpl)))
+
+        # 2) 基础子分支：只写入开放关系原子。
+        base = self.clone()
+        for rel, raw_tuple in materialized:
+            if rel not in self.closed:
+                base.instance[rel].add(raw_tuple)
+
+        # 3) 封闭原子逐个按见证候选做笛卡尔积扩展。
+        children: list[ChaseEngine] = [base]
+        for rel, raw_tuple in materialized:
+            if rel not in self.closed:
+                continue
+            next_children: list[ChaseEngine] = []
+            for child in children:
+                candidates = child._closed_candidates(rel, raw_tuple)
+                for fact_tuple in candidates:
+                    grand = child.clone()
+                    try:
+                        grand._bind_closed_witness(raw_tuple, fact_tuple)
+                    except InconsistentError:
+                        continue  # 该候选要求同一对象等于两个不同常量
+                    next_children.append(grand)
+            children = next_children
+            if not children:
+                break
+        return children
 
     # ------------------------------------------------------------------
     # 主循环
@@ -409,27 +637,68 @@ class ChaseEngine:
         return sorted(results, key=lambda t: tuple(s.encode("utf-8") for s in t))
 
 
-def chase_all(schema: dict, facts: list[dict], rules: list[dict]) -> list[ChaseEngine]:
+def chase_all(
+    schema: dict,
+    facts: list[dict],
+    rules: list[dict],
+    closed_relations: list[str] | None = None,
+) -> list[ChaseEngine]:
     """析取 chase：返回全部自洽且收敛的分支（每个都是一个合法世界）。
 
-    返回空列表表示不存在任何合法世界。某个方案选择导致冲突只丢弃
-    对应分支，不直接判整题无解。
+    返回空列表表示不存在任何合法世界。分裂点有两类：
+
+    * 析取规则的未满足 ``(规则, 绑定)``：按方案数分裂；
+    * 封闭关系的多候选见证：按可匹配的输入事实行分裂。
+
+    单个选择导致常量冲突只丢弃对应分支，不直接判整题无解；所有分支
+    都冲突时返回空列表，由上层输出 ``inconsistent``。
     """
     final: list[ChaseEngine] = []
-    stack = [ChaseEngine(schema, facts, rules)]
+    stack = [ChaseEngine(schema, facts, rules, closed_relations)]
     while stack:
         branch = stack.pop()
+
+        # 优先消费挂起的封闭关系多候选：每个候选一个子分支。挂起元组
+        # 中的存在对象在**每个子分支内**替换为该分支私有的新空对象
+        # （并查集、实例元组、Skolem 缓存键与值同步重映射），使各候选
+        # 的见证身份显式独立；随后绑定该候选见证，常量冲突即丢弃该
+        # 子分支。
+        if branch.pending is not None:
+            rel, raw_tuple, candidates = branch.pending
+            branch.pending = None
+            suspended_nulls = [v[1] for v in raw_tuple if v[0] == "n"]
+            for fact_tuple in candidates:
+                child = branch.clone()
+                id_map = child._remap_nulls_fresh(set(suspended_nulls))
+                child_tuple = tuple(
+                    ("n", id_map[v[1]]) if v[0] == "n" else v
+                    for v in raw_tuple
+                )
+                try:
+                    child._bind_closed_witness(child_tuple, fact_tuple)
+                except InconsistentError:
+                    continue
+                stack.append(child)
+            continue
+
         try:
             branch.stabilize()
         except InconsistentError:
             continue  # 该分支不可能对应任何合法世界
+        except _Suspended:
+            # 确定性规则触发封闭关系多候选：同分支带着挂起信息回栈，
+            # 下一轮按候选分裂（已完成的合并/元组变化都保留在分支上）。
+            stack.append(branch)
+            continue
+
         todo = branch.next_unsatisfied_alternative()
         if todo is None:
             final.append(branch)
             continue
         rule_idx, binding = todo
         for alt in branch.rules[rule_idx]["alternatives"]:
-            child = branch.clone()
-            child.apply_alternative(alt, binding)
-            stack.append(child)
+            # 每个方案一次性展开：开放原子写入 + 封闭原子见证组合；
+            # 无自洽见证组合时返回空列表，该方案对当前绑定整体失效。
+            children = branch.expand_alternative(alt, binding)
+            stack.extend(children)
     return final
