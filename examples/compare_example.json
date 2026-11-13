@@ -1,0 +1,25 @@
+{
+  "schema": {
+    "A": {"arity": 1, "ranks": [0], "key": [0]},
+    "B": {"arity": 1, "ranks": [0], "key": [0]},
+    "C": {"arity": 1, "ranks": [0], "key": [0]}
+  },
+  "facts": [],
+  "rules": [
+    {
+      "body": [{"rel": "A", "args": ["x"]}],
+      "alternatives": [
+        [{"rel": "B", "args": ["x"]}],
+        [{"rel": "C", "args": ["x"]}]
+      ]
+    }
+  ],
+  "query": {
+    "body": [{"rel": "A", "args": ["x"]}],
+    "project": ["x"]
+  },
+  "compare_query": {
+    "body": [{"rel": "B", "args": ["x"]}],
+    "project": ["x"]
+  }
+}

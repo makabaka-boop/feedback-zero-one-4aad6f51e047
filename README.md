@@ -3,7 +3,9 @@
 从零实现的 Python（仅标准库）后端：接收包含 `schema` / `facts` / `rules` /
 `query` 的 JSON，在**所有合法世界共有**的语义下计算查询的必然答案
 （certain answers）。规则结论支持单原子 `head` 与析取方案
-`alternatives`（恰选一个）。
+`alternatives`（恰选一个）。可选 `compare_query` 进一步报告：在**每个
+合法世界**中旧查询结果是否都包含于新查询结果（`contained`），不成立时
+给出一个有限反例（`counterexample`）。
 
 ## 目录结构
 
@@ -14,16 +16,19 @@
 │   ├── __main__.py           # 命令行入口 python -m chase_backend
 │   ├── validator.py          # 完整输入校验（错误带 JSON 字段路径）
 │   ├── engine.py             # chase 引擎：并查集 + Skolem 空对象 + 键合并 + 析取分支
-│   ├── solver.py             # 校验 -> chase -> 查询 的编排
+│   ├── containment.py        # compare_query 包含性检查：冻结 + 分模式 chase + 反例构造
+│   ├── solver.py             # 校验 -> chase -> 查询（-> 包含性检查）的编排
 │   ├── io_utils.py           # 原子写入（临时文件 + os.replace）
 │   └── errors.py             # ValidationError / InconsistentError
 ├── tests/
-│   └── test_acceptance.py    # 独立验收（55 项，仅依赖 unittest）
+│   └── test_acceptance.py    # 独立验收（77 项，仅依赖 unittest）
 ├── examples/
 │   ├── spec_example.json                  # 题面示例输入
 │   ├── spec_example.expected.json         # 期望输出
 │   ├── alternatives_example.json          # 析取方案示例输入
-│   └── alternatives_example.expected.json # 期望输出
+│   ├── alternatives_example.expected.json # 期望输出
+│   ├── compare_example.json               # compare_query 示例输入
+│   └── compare_example.expected.json      # 期望输出（含反例）
 └── README.md
 ```
 
@@ -71,6 +76,9 @@
     存在变量所在列的 rank 必须严格高于整个 body 所有位置的最高
     rank。
 * **query**：非空 `body` 与非空 `project`，投影变量必须在 body 出现。
+* **compare_query**（可选）：结构沿用 `query`，且 `project` 长度必须与
+  `query` 的 `project` 等长；提供时输出报告追加 `contained` 与
+  `counterexample`（见下）。
 * 关系引用与元数必须匹配；名称限非空 ASCII 字母数字串，常量为
   Unicode 字符串。
 
@@ -92,7 +100,22 @@
 * `{"status": "ok", "answers": [[...], ...]}`：只包含各分量都是
   **输入事实常量**的投影元组（匿名标识不能作为答案），去重后按
   **UTF-8 元组字典序**（逐分量比较 UTF-8 字节序列）排序。
-* `{"status": "inconsistent"}`：无合法世界。
+* 输入带 `compare_query` 时，`ok` 报告追加两个字段：
+  * `contained`：布尔。表示在**每个**包含输入事实、满足全部规则与
+    键的合法世界中，旧查询（`query`）结果都包含于新查询
+    （`compare_query`）结果。两查询的变量各自独立绑定、按投影位置
+    比较；结果元组**允许匿名对象**（与 `answers` 只保留常量不同）；
+    合法世界允许增添对象与事实、允许无限，因此不能仅比较当前答案。
+  * `counterexample`：`contained` 成立时为 `null`；否则为任一有限
+    反例 `{"objects", "facts", "tuple"}`：
+    * `objects`：非空 ASCII 字母数字对象名 -> 常量字符串或 `null`
+      （匿名）；各名表示不同对象，非 `null` 值唯一且覆盖全部输入
+      常量；
+    * `facts`：沿用原子结构（`rel` + `args`），`args` 引用对象名；
+      整个世界包含全部输入事实、满足全部规则与键约束；
+    * `tuple`：引用对象名的投影元组，命中旧查询而不命中新查询。
+* `{"status": "inconsistent"}`：无合法世界（此时即使带了
+  `compare_query` 也仅报 `inconsistent`，不追加上述字段）。
 
 ## 语义与算法
 
@@ -147,6 +170,34 @@ Skolem 对象由低 rank 的有限取值决定，也是有限的；键合并只�
 分量规范化后都是常量的元组；取**所有分支的交集**（即所有合法世界
 共有的答案），去重并按 UTF-8 字节序排序。
 
+### compare_query 包含性（冻结 + 分模式 chase）
+
+`contained` 要在**所有合法世界**上比较两个查询的结果（含匿名对象
+分量），而合法世界可任意增添对象与事实、允许无限，因此不能只比较
+当前 `answers`。判定方法：
+
+1. 旧查询 body 在合法世界中的一个匹配，把每个变量映到某个输入常量
+   或某个匿名对象。按“哪些变量映到同一常量 / 同一匿名对象”把匹配
+   分成有限多种**等值模式**：每个变量或取某个输入常量，或取某个
+   匿名块（块内同值、块间互异且异于所有常量）。
+2. 对每种模式，把旧查询 body **冻结**成事实（常量照常、匿名块取
+   全新空对象）加入输入事实得到 J，对 J 跑完整的析取 chase：
+   * 无存活分支：不存在包含该模式匹配的合法世界，该模式不产生
+     反例；
+   * 某存活分支中冻结投影元组 t 不命中新查询：该分支本身就是一
+     个有限合法世界，直接作为有限反例输出；
+   * 所有存活分支都令 t 命中新查询：由 chase 的通用性（任意包含
+     J 的合法世界都包含某存活分支保持 J 对象的同态像），所有
+     包含该模式匹配的合法世界都令 t 命中新查询。
+3. 所有模式都通过则 `contained=true`、`counterexample=null`；否则
+   取首个违例分支构造反例（规范化事实 + 对象命名 + 投影元组）。
+
+例：空事实，一元关系均 rank=0、键 `[0]`，规则 `A(x)->B(x)` 或
+`C(x)`，旧查 `A`、新查 `B`：合法世界可含 `A(o)`、`C(o)` 而
+不含 `B(o)`，故 `contained=false`，反例正是该世界与元组 `(o)`；
+再加规则 `C(x)->B(x)` 后每个含 `A(o)` 的世界都含 `B(o)`，
+`contained=true`。
+
 ## 使用方式
 
 ### 命令行（入口）
@@ -183,7 +234,7 @@ python -I tests/test_acceptance.py
 python -m unittest discover -s tests -t .
 ```
 
-覆盖场景（55 项）：
+覆盖场景（77 项）：
 
 * 题面示例（缺关联对象经键合并补回必然答案）及无确定答案对照组；
 * 递归：传递闭包、带环图终止与去重；
@@ -195,10 +246,18 @@ python -m unittest discover -s tests -t .
   局部结论不是）、不同匹配被迫选不同方案、方案内共享见证、方案
   见证经键合并触发新匹配、部分方案冲突不判整题无解、全部方案冲突
   判 inconsistent、空事实；
+* compare_query：任务书包含性例（析取选择使 contained=false、补
+  规则后 true）、两查询 answers 均空但 contained=false（不能仅比
+  当前答案）、常量元组反例、变量各自绑定按投影位置比较、键合并与
+  可增添匿名行的世界、inconsistent 时仅报 inconsistent、省略
+  compare_query 时保持原报告结构，以及 compare_query 的非法结构/
+  引用/投影等长定位（零基数组下标）；反例均经独立校验器复核
+  （对象命名、覆盖输入常量、合法世界、tuple 命中条件）；
 * 非法输入字段定位（布尔冒充整数、rank 越界/等长、键空/重复/越界、
   未知关系、元数不符、非 ASCII 变量名、rank 安全违规、投影变量
   不在 body、缺字段/多字段，以及 alternatives 非空数组/非空方案
   数组/与 head 互斥/方案内引用与 rank 定位到零基数组下标等）并
   整次拒绝；
 * CLI：成功原子替换、非法输入保留旧输出、`inconsistent` 正常落盘、
-  输入缺失时不产生输出、alternatives 输入正常求解。
+  输入缺失时不产生输出、alternatives 输入正常求解、compare_query
+  输入正常求解（含反例落盘）、compare_query 非法保留旧输出。

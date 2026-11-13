@@ -1,0 +1,27 @@
+{
+  "status": "ok",
+  "answers": [],
+  "contained": false,
+  "counterexample": {
+    "objects": {
+      "o0": null
+    },
+    "facts": [
+      {
+        "rel": "A",
+        "args": [
+          "o0"
+        ]
+      },
+      {
+        "rel": "C",
+        "args": [
+          "o0"
+        ]
+      }
+    ],
+    "tuple": [
+      "o0"
+    ]
+  }
+}

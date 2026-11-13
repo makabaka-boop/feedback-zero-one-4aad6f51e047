@@ -20,7 +20,12 @@
 10. 析取方案 alternatives：任务书析取例、不同匹配须选不同方案、
     方案内共享见证、方案见证经键合并触发新匹配、部分方案冲突、
     全部方案冲突、空事实，以及 alternatives 的非法结构/引用/rank
-    定位（零基数组下标）。
+    定位（零基数组下标）；
+11. compare_query 包含性：任务书析取例（false -> 补规则后 true）、
+    匿名结果（不能仅比当前答案）、常量元组反例、变量各自绑定、
+    键合并与可增添匿名行的世界、inconsistent 仅报 inconsistent、
+    省略时保持原报告结构、非法 compare_query 字段定位与整次拒绝、
+    CLI 落盘；所有反例经独立校验器复核。
 """
 
 from __future__ import annotations
@@ -1134,6 +1139,565 @@ class TestCLI(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         err = json.loads(proc.stderr)
         self.assertTrue(err["path"].endswith("rules[0].alternatives"))
+        # 旧结果必须原封不动。
+        with open(self.output_path, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh), old_result)
+
+
+def _match_atoms_world(atoms, rel_facts):
+    """显式有限世界上的全部同态匹配（变量 -> 对象名）。"""
+    bindings = [{}]
+    for atom in atoms:
+        next_bindings = []
+        for binding in bindings:
+            for args in rel_facts.get(atom["rel"], []):
+                candidate = dict(binding)
+                ok = True
+                for var, name in zip(atom["args"], args):
+                    if var in candidate:
+                        if candidate[var] != name:
+                            ok = False
+                            break
+                    else:
+                        candidate[var] = name
+                if ok:
+                    next_bindings.append(candidate)
+        bindings = next_bindings
+    return bindings
+
+
+def _extendable_world(atoms, binding, rel_facts):
+    """是否存在延拓 binding 的匹配（未绑定变量可任取世界对象）。"""
+    if not atoms:
+        return True
+    atom, rest = atoms[0], atoms[1:]
+    for args in rel_facts.get(atom["rel"], []):
+        candidate = dict(binding)
+        ok = True
+        for var, name in zip(atom["args"], args):
+            if var in candidate and candidate[var] != name:
+                ok = False
+                break
+            candidate[var] = name
+        if ok and _extendable_world(rest, candidate, rel_facts):
+            return True
+    return False
+
+
+def assert_valid_counterexample(case, payload, cx):
+    """独立校验 compare_query 反例：结构、合法世界、tuple 命中条件。"""
+    case.assertIsInstance(cx, dict)
+    case.assertEqual(set(cx), {"objects", "facts", "tuple"})
+    objects = cx["objects"]
+    case.assertIsInstance(objects, dict)
+    case.assertTrue(objects, "objects 不能为空")
+    consts = []
+    for name, value in objects.items():
+        case.assertTrue(
+            name and all(ch.isascii() and ch.isalnum() for ch in name),
+            f"对象名 {name!r} 须为非空 ASCII 字母数字串",
+        )
+        case.assertTrue(value is None or isinstance(value, str))
+        if value is not None:
+            consts.append(value)
+    case.assertEqual(len(consts), len(set(consts)), "非 null 值必须唯一")
+    input_consts = {c for f in payload["facts"] for c in f["args"]}
+    case.assertTrue(
+        input_consts <= set(consts), "非 null 值必须覆盖全部输入常量"
+    )
+
+    schema = payload["schema"]
+    rel_facts = {}
+    for fact in cx["facts"]:
+        case.assertEqual(set(fact), {"rel", "args"})
+        case.assertIn(fact["rel"], schema)
+        case.assertEqual(len(fact["args"]), schema[fact["rel"]]["arity"])
+        for name in fact["args"]:
+            case.assertIn(name, objects)
+        rel_facts.setdefault(fact["rel"], []).append(fact["args"])
+    for name in cx["tuple"]:
+        case.assertIn(name, objects)
+    case.assertEqual(len(cx["tuple"]), len(payload["query"]["project"]))
+
+    # 合法世界：包含全部输入事实。
+    for fact in payload["facts"]:
+        case.assertTrue(
+            any(
+                wf["rel"] == fact["rel"]
+                and all(
+                    objects[name] == const
+                    for name, const in zip(wf["args"], fact["args"])
+                )
+                for wf in cx["facts"]
+            ),
+            f"反例缺少输入事实 {fact}",
+        )
+    # 键约束：键相同的元组所有列相同。
+    for rel, args_list in rel_facts.items():
+        by_key = {}
+        for args in args_list:
+            key = tuple(args[c] for c in schema[rel]["key"])
+            case.assertTrue(
+                by_key.get(key, args) == args, f"关系 {rel} 键约束被违反"
+            )
+            by_key[key] = args
+    # 全部规则（head 单原子 / alternatives 方案）。
+    for rule in payload["rules"]:
+        for match in _match_atoms_world(rule["body"], rel_facts):
+            if "head" in rule:
+                case.assertTrue(
+                    _extendable_world([rule["head"]], match, rel_facts),
+                    f"规则 head 未满足: {rule}",
+                )
+            else:
+                case.assertTrue(
+                    any(
+                        _extendable_world(alt, match, rel_facts)
+                        for alt in rule["alternatives"]
+                    ),
+                    f"析取规则无方案满足: {rule}",
+                )
+    # tuple 命中旧查询而不命中新查询。
+    old_results = {
+        tuple(b[v] for v in payload["query"]["project"])
+        for b in _match_atoms_world(payload["query"]["body"], rel_facts)
+    }
+    new_results = {
+        tuple(b[v] for v in payload["compare_query"]["project"])
+        for b in _match_atoms_world(payload["compare_query"]["body"], rel_facts)
+    }
+    case.assertIn(tuple(cx["tuple"]), old_results)
+    case.assertNotIn(tuple(cx["tuple"]), new_results)
+
+
+class TestCompareSpecExample(unittest.TestCase):
+    """任务书 compare_query 例：空事实，一元关系 rank=0 键[0]，
+    A(x)->B(x)或C(x)，旧查 A、新查 B。"""
+
+    def _payload(self, with_cb_rule):
+        rules = [
+            {
+                "body": [{"rel": "A", "args": ["x"]}],
+                "alternatives": [
+                    [{"rel": "B", "args": ["x"]}],
+                    [{"rel": "C", "args": ["x"]}],
+                ],
+            }
+        ]
+        if with_cb_rule:
+            rules.append(
+                {
+                    "body": [{"rel": "C", "args": ["x"]}],
+                    "head": {"rel": "B", "args": ["x"]},
+                }
+            )
+        return {
+            "schema": _schema_r(
+                A=(1, [0], [0]), B=(1, [0], [0]), C=(1, [0], [0])
+            ),
+            "facts": [],
+            "rules": rules,
+            "query": {
+                "body": [{"rel": "A", "args": ["x"]}],
+                "project": ["x"],
+            },
+            "compare_query": {
+                "body": [{"rel": "B", "args": ["x"]}],
+                "project": ["x"],
+            },
+        }
+
+    def test_disjunctive_choice_breaks_containment(self):
+        payload = self._payload(False)
+        result = solve(payload)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["answers"], [])
+        self.assertIs(result["contained"], False)
+        assert_valid_counterexample(self, payload, result["counterexample"])
+
+    def test_added_rule_restores_containment(self):
+        payload = self._payload(True)
+        result = solve(payload)
+        self.assertEqual(result["status"], "ok")
+        self.assertIs(result["contained"], True)
+        self.assertIsNone(result["counterexample"])
+
+
+class TestCompareAnonymousResults(unittest.TestCase):
+    """不能仅比当前答案：两查询 answers 都为空，contained 仍为 false。"""
+
+    def _payload(self, with_copy_rule):
+        rules = [
+            {
+                "body": [{"rel": "A", "args": ["x"]}],
+                "head": {"rel": "R", "args": ["x", "y"]},
+            }
+        ]
+        if with_copy_rule:
+            rules.append(
+                {
+                    "body": [{"rel": "R", "args": ["x", "y"]}],
+                    "head": {"rel": "S", "args": ["x", "y"]},
+                }
+            )
+        return {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                R=(2, [0, 1], [0, 1]),
+                S=(2, [0, 1], [0, 1]),
+            ),
+            "facts": [{"rel": "A", "args": ["a"]}],
+            "rules": rules,
+            "query": {
+                "body": [{"rel": "R", "args": ["x", "y"]}],
+                "project": ["x", "y"],
+            },
+            "compare_query": {
+                "body": [{"rel": "S", "args": ["x", "y"]}],
+                "project": ["x", "y"],
+            },
+        }
+
+    def test_anonymous_results_still_break_containment(self):
+        payload = self._payload(False)
+        result = solve(payload)
+        # 两查询的常量答案都为空，但合法世界可增添匿名对象与事实。
+        self.assertEqual(result["answers"], [])
+        self.assertIs(result["contained"], False)
+        assert_valid_counterexample(self, payload, result["counterexample"])
+
+    def test_copy_rule_gives_containment(self):
+        payload = self._payload(True)
+        result = solve(payload)
+        self.assertIs(result["contained"], True)
+        self.assertIsNone(result["counterexample"])
+
+
+class TestCompareConstantTuple(unittest.TestCase):
+    """常量元组反例：facts R(a)，无规则，旧查 R、新查 S。"""
+
+    def test_counterexample_names_input_constant(self):
+        payload = {
+            "schema": _schema_r(R=(1, [0], [0]), S=(1, [0], [0])),
+            "facts": [{"rel": "R", "args": ["a"]}],
+            "rules": [],
+            "query": {
+                "body": [{"rel": "R", "args": ["x"]}],
+                "project": ["x"],
+            },
+            "compare_query": {
+                "body": [{"rel": "S", "args": ["x"]}],
+                "project": ["x"],
+            },
+        }
+        result = solve(payload)
+        self.assertEqual(result["answers"], [["a"]])
+        self.assertIs(result["contained"], False)
+        self.assertEqual(
+            result["counterexample"],
+            {
+                "objects": {"o0": "a"},
+                "facts": [{"rel": "R", "args": ["o0"]}],
+                "tuple": ["o0"],
+            },
+        )
+        assert_valid_counterexample(self, payload, result["counterexample"])
+
+
+class TestCompareIndependentBinding(unittest.TestCase):
+    """两查询变量各自绑定、按投影位置比较。"""
+
+    def _payload(self, compare_body):
+        return {
+            "schema": _schema_r(
+                R=(2, [0, 0], [0, 1]),
+                S=(2, [0, 0], [0, 1]),
+            ),
+            "facts": [{"rel": "R", "args": ["a", "b"]}],
+            "rules": [
+                {
+                    "body": [{"rel": "R", "args": ["x", "y"]}],
+                    "head": {"rel": "S", "args": ["x", "y"]},
+                }
+            ],
+            "query": {
+                "body": [{"rel": "R", "args": ["x", "y"]}],
+                "project": ["x"],
+            },
+            "compare_query": {
+                "body": compare_body,
+                "project": ["x"],
+            },
+        }
+
+    def test_same_name_vars_are_still_independent(self):
+        # q2 的 x 同时占两列：S(a,b) 不能证明 S(a,a)。
+        payload = self._payload([{"rel": "S", "args": ["x", "x"]}])
+        result = solve(payload)
+        self.assertIs(result["contained"], False)
+        assert_valid_counterexample(self, payload, result["counterexample"])
+
+    def test_positional_projection_gives_containment(self):
+        payload = self._payload([{"rel": "S", "args": ["x", "y"]}])
+        result = solve(payload)
+        self.assertIs(result["contained"], True)
+        self.assertIsNone(result["counterexample"])
+
+
+class TestCompareKeyMerge(unittest.TestCase):
+    """冻结体经键合并与常量相等、世界可增添匿名行等情形的包含性。"""
+
+    def _payload(self):
+        return {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                B=(2, [0, 1], [0, 1]),
+                R=(2, [0, 1], [0]),
+            ),
+            "facts": [
+                {"rel": "A", "args": ["a"]},
+                {"rel": "B", "args": ["a", "b"]},
+            ],
+            "rules": [
+                {
+                    "body": [{"rel": "A", "args": ["x"]}],
+                    "head": {"rel": "R", "args": ["x", "y"]},
+                },
+                {
+                    "body": [{"rel": "B", "args": ["x", "z"]}],
+                    "head": {"rel": "R", "args": ["x", "z"]},
+                },
+            ],
+            "query": {
+                "body": [{"rel": "R", "args": ["x", "y"]}],
+                "project": ["x", "y"],
+            },
+            "compare_query": {
+                "body": [{"rel": "B", "args": ["x", "y"]}],
+                "project": ["x", "y"],
+            },
+        }
+
+    def test_world_may_add_rows_breaking_containment(self):
+        # 合法世界可增添 R 的匿名行，B 覆盖不到。
+        payload = self._payload()
+        result = solve(payload)
+        self.assertIs(result["contained"], False)
+        assert_valid_counterexample(self, payload, result["counterexample"])
+
+    def test_rule_backed_containment_holds(self):
+        # B(x,z)->R(x,z)：B 的每行都被规则搬进 R。
+        payload = self._payload()
+        payload["query"] = {
+            "body": [{"rel": "B", "args": ["x", "z"]}],
+            "project": ["x", "z"],
+        }
+        payload["compare_query"] = {
+            "body": [{"rel": "R", "args": ["x", "y"]}],
+            "project": ["x", "y"],
+        }
+        result = solve(payload)
+        self.assertIs(result["contained"], True)
+        self.assertIsNone(result["counterexample"])
+
+
+class TestCompareInconsistent(unittest.TestCase):
+    def test_inconsistent_still_reports_only_inconsistent(self):
+        payload = {
+            "schema": _schema_r(
+                R=(2, [0, 1], [0]),
+                S=(2, [0, 1], [0]),
+            ),
+            "facts": [
+                {"rel": "R", "args": ["a", "b"]},
+                {"rel": "R", "args": ["a", "c"]},
+            ],
+            "rules": [],
+            "query": {
+                "body": [{"rel": "R", "args": ["x", "y"]}],
+                "project": ["x"],
+            },
+            "compare_query": {
+                "body": [{"rel": "S", "args": ["x", "y"]}],
+                "project": ["x"],
+            },
+        }
+        self.assertEqual(solve(payload), {"status": "inconsistent"})
+
+
+class TestCompareOmitted(unittest.TestCase):
+    def test_omitted_compare_query_keeps_old_report_shape(self):
+        payload = {
+            "schema": _schema_r(Q=(1, [0], [0])),
+            "facts": [{"rel": "Q", "args": ["a"]}],
+            "rules": [],
+            "query": {
+                "body": [{"rel": "Q", "args": ["x"]}],
+                "project": ["x"],
+            },
+        }
+        result = solve(payload)
+        self.assertEqual(result, {"status": "ok", "answers": [["a"]]})
+        self.assertNotIn("contained", result)
+        self.assertNotIn("counterexample", result)
+
+
+class TestCompareValidation(unittest.TestCase):
+    def _base(self):
+        return {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                B=(1, [0], [0]),
+                C=(2, [0, 1], [0, 1]),
+            ),
+            "facts": [{"rel": "A", "args": ["a"]}],
+            "rules": [],
+            "query": {
+                "body": [{"rel": "A", "args": ["x"]}],
+                "project": ["x"],
+            },
+            "compare_query": {
+                "body": [{"rel": "B", "args": ["x"]}],
+                "project": ["x"],
+            },
+        }
+
+    def assertRejects(self, payload, path_suffix):
+        with self.assertRaises(ValidationError) as ctx:
+            solve(payload)
+        self.assertTrue(
+            ctx.exception.path.endswith(path_suffix),
+            f"路径 {ctx.exception.path!r} 应以 {path_suffix!r} 结尾",
+        )
+
+    def test_compare_not_object(self):
+        p = self._base()
+        p["compare_query"] = []
+        self.assertRejects(p, "$.compare_query")
+
+    def test_compare_missing_body(self):
+        p = self._base()
+        del p["compare_query"]["body"]
+        self.assertRejects(p, "compare_query.body")
+
+    def test_compare_empty_body(self):
+        p = self._base()
+        p["compare_query"]["body"] = []
+        self.assertRejects(p, "compare_query.body")
+
+    def test_compare_unknown_relation(self):
+        p = self._base()
+        p["compare_query"]["body"][0]["rel"] = "Ghost"
+        self.assertRejects(p, "compare_query.body[0].rel")
+
+    def test_compare_arity_mismatch(self):
+        p = self._base()
+        p["compare_query"]["body"][0]["args"] = ["x", "y"]
+        self.assertRejects(p, "compare_query.body[0].args")
+
+    def test_compare_non_ascii_variable(self):
+        p = self._base()
+        p["compare_query"]["body"][0]["args"] = ["变量"]
+        self.assertRejects(p, "compare_query.body[0].args[0]")
+
+    def test_compare_project_var_not_in_body(self):
+        p = self._base()
+        p["compare_query"]["project"] = ["z"]
+        self.assertRejects(p, "compare_query.project[0]")
+
+    def test_compare_projection_length_mismatch(self):
+        p = self._base()
+        p["compare_query"] = {
+            "body": [{"rel": "C", "args": ["x", "y"]}],
+            "project": ["x", "y"],
+        }
+        self.assertRejects(p, "compare_query.project")
+
+    def test_compare_extra_key(self):
+        p = self._base()
+        p["compare_query"]["unexpected"] = 1
+        self.assertRejects(p, "compare_query.unexpected")
+
+
+class TestCompareCLI(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="chase-compare-")
+        self.input_path = os.path.join(self.tmp, "in.json")
+        self.output_path = os.path.join(self.tmp, "out.json")
+
+    def _write_input(self, payload):
+        with open(self.input_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False)
+
+    def _run_cli(self):
+        return subprocess.run(
+            [sys.executable, "-m", "chase_backend",
+             self.input_path, self.output_path],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_compare_query_written_to_output(self):
+        """原文件入口接入 compare_query：任务书析取例经 CLI 求解。"""
+        payload = {
+            "schema": _schema_r(
+                A=(1, [0], [0]), B=(1, [0], [0]), C=(1, [0], [0])
+            ),
+            "facts": [],
+            "rules": [
+                {
+                    "body": [{"rel": "A", "args": ["x"]}],
+                    "alternatives": [
+                        [{"rel": "B", "args": ["x"]}],
+                        [{"rel": "C", "args": ["x"]}],
+                    ],
+                }
+            ],
+            "query": {
+                "body": [{"rel": "A", "args": ["x"]}],
+                "project": ["x"],
+            },
+            "compare_query": {
+                "body": [{"rel": "B", "args": ["x"]}],
+                "project": ["x"],
+            },
+        }
+        self._write_input(payload)
+        proc = self._run_cli()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(self.output_path, encoding="utf-8") as fh:
+            result = json.load(fh)
+        self.assertEqual(result["status"], "ok")
+        self.assertIs(result["contained"], False)
+        assert_valid_counterexample(self, payload, result["counterexample"])
+
+    def test_invalid_compare_query_keeps_old_output(self):
+        """compare_query 非法：整次拒绝并保留旧输出文件。"""
+        old_result = {"status": "ok", "answers": [["OLD"]]}
+        atomic_write_json(self.output_path, old_result)
+        payload = {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                B=(1, [0], [0]),
+                C=(2, [0, 1], [0, 1]),
+            ),
+            "facts": [{"rel": "A", "args": ["a"]}],
+            "rules": [],
+            "query": {
+                "body": [{"rel": "A", "args": ["x"]}],
+                "project": ["x"],
+            },
+            "compare_query": {
+                "body": [{"rel": "C", "args": ["x", "y"]}],
+                "project": ["x", "y"],  # 投影长度与 query 不一致
+            },
+        }
+        self._write_input(payload)
+        proc = self._run_cli()
+        self.assertNotEqual(proc.returncode, 0)
+        err = json.loads(proc.stderr)
+        self.assertTrue(err["path"].endswith("compare_query.project"))
         # 旧结果必须原封不动。
         with open(self.output_path, encoding="utf-8") as fh:
             self.assertEqual(json.load(fh), old_result)

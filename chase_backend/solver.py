@@ -1,9 +1,11 @@
-"""顶层求解编排：校验 -> 析取 chase -> 各合法世界共有的查询答案。"""
+"""顶层求解编排：校验 -> 析取 chase -> 各合法世界共有的查询答案；
+可选 compare_query -> 全合法世界包含性检查。"""
 
 from __future__ import annotations
 
 from typing import Any
 
+from .containment import check_containment
 from .engine import chase_all
 from .validator import validate
 
@@ -18,6 +20,16 @@ def solve(payload: Any) -> dict:
       去重后按 UTF-8 元组字典序排列；
     * ``{"status": "inconsistent"}`` —— 无任何合法世界（所有分支都
       因键约束要求两个不同常量相等而冲突）。
+
+    若输入带可选的 ``compare_query``，``ok`` 报告追加两个字段：
+
+    * ``contained``：在每个包含输入事实、满足全部规则与键的合法世界
+      中，旧查询结果（允许匿名对象、按投影位置比较）是否都包含于
+      新查询结果；
+    * ``counterexample``：``contained`` 成立时为 ``None``，否则为任一
+      有限反例 ``{"objects", "facts", "tuple"}``。
+
+    无合法世界时仍仅报 ``inconsistent``（不追加这两个字段）。
 
     输入非法时抛出 :class:`~chase_backend.errors.ValidationError`，
     由调用方负责整次拒绝并保留旧输出。
@@ -37,4 +49,15 @@ def solve(payload: Any) -> dict:
         common if common is not None else set(),
         key=lambda t: tuple(s.encode("utf-8") for s in t),
     )
-    return {"status": "ok", "answers": [list(t) for t in ordered]}
+    result: dict = {"status": "ok", "answers": [list(t) for t in ordered]}
+    if problem["compare_query"] is not None:
+        contained, counterexample = check_containment(
+            problem["schema"],
+            problem["facts"],
+            problem["rules"],
+            problem["query"],
+            problem["compare_query"],
+        )
+        result["contained"] = contained
+        result["counterexample"] = counterexample
+    return result

@@ -184,7 +184,8 @@ class ChaseEngine:
         for rel, decl in self.schema.items():
             key_cols = decl["key"]
             idx: dict[tuple, tuple] = {}
-            for raw_tuple in self.instance[rel]:
+            # 排序遍历：合并顺序确定，反例等输出可复现（结果语义不变）。
+            for raw_tuple in sorted(self.instance[rel]):
                 canon = tuple(self.uf.canon(v) for v in raw_tuple)
                 key = tuple(canon[c] for c in key_cols)
                 existing = idx.get(key)
@@ -232,10 +233,11 @@ class ChaseEngine:
             next_matches: list[dict[str, tuple]] = []
             for binding in matches:
                 # 用索引中的规范化元组做匹配，保证同值变量取值一致。
-                # 快照取值：本轮规则触发可能向同一索引插入新键，
+                # 排序快照取值：本轮规则触发可能向同一索引插入新键，
                 # 直接迭代变化中的字典会抛 RuntimeError，新元组留待
-                # 下一轮外层循环处理即可（不动点语义不变）。
-                for canon_tuple in list(idx.values()):
+                # 下一轮外层循环处理即可（不动点语义不变）；排序使
+                # 触发顺序确定，反例等输出可复现。
+                for canon_tuple in sorted(idx.values()):
                     candidate = dict(binding)
                     ok = True
                     for col, var in enumerate(args):
@@ -409,14 +411,14 @@ class ChaseEngine:
         return sorted(results, key=lambda t: tuple(s.encode("utf-8") for s in t))
 
 
-def chase_all(schema: dict, facts: list[dict], rules: list[dict]) -> list[ChaseEngine]:
-    """析取 chase：返回全部自洽且收敛的分支（每个都是一个合法世界）。
+def chase_branches(initial: ChaseEngine) -> list[ChaseEngine]:
+    """从给定初始分支出发的析取 chase：返回全部自洽且收敛的分支。
 
     返回空列表表示不存在任何合法世界。某个方案选择导致冲突只丢弃
     对应分支，不直接判整题无解。
     """
     final: list[ChaseEngine] = []
-    stack = [ChaseEngine(schema, facts, rules)]
+    stack = [initial]
     while stack:
         branch = stack.pop()
         try:
@@ -433,3 +435,8 @@ def chase_all(schema: dict, facts: list[dict], rules: list[dict]) -> list[ChaseE
             child.apply_alternative(alt, binding)
             stack.append(child)
     return final
+
+
+def chase_all(schema: dict, facts: list[dict], rules: list[dict]) -> list[ChaseEngine]:
+    """以输入事实为初始实例的析取 chase（见 chase_branches）。"""
+    return chase_branches(ChaseEngine(schema, facts, rules))

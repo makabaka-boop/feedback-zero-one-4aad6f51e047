@@ -11,7 +11,9 @@
   每项为非空原子数组）恰选一个；
 * 规则的 rank 安全性（对 head 或每个方案原子逐原子沿用）：结论共有
   变量所在列 rank 不低于该变量任一 body 位置，结论存在变量所在列
-  rank 严格高于整个 body 所有位置的最高 rank。
+  rank 严格高于整个 body 所有位置的最高 rank；
+* 可选 ``compare_query``：结构沿用 ``query``（非空 body / project、
+  投影变量须在 body 出现），且投影长度须与 ``query`` 一致。
 
 任何一处不合法都抛出 :class:`ValidationError`，错误信息带 JSON 路径
 （数组下标为零基），由上层整次拒绝、不产生新输出。
@@ -24,7 +26,7 @@ from typing import Any
 from .errors import ValidationError
 
 # 允许出现的 ASCII 字母数字字符（名称内部使用 isascii/isalnum 判定）。
-_TOP_LEVEL_KEYS = {"schema", "facts", "rules", "query"}
+_TOP_LEVEL_KEYS = {"schema", "facts", "rules", "query", "compare_query"}
 _SCHEMA_KEYS = {"arity", "ranks", "key"}
 _ATOM_KEYS = {"rel", "args"}
 _RULE_KEYS = {"body", "head", "alternatives"}
@@ -254,24 +256,27 @@ def _check_rules(raw_rules: Any, schema: dict) -> list[dict]:
     return rules
 
 
-def _check_query(raw_query: Any, schema: dict) -> dict:
-    path = "$.query"
-    query_obj = _require_object(raw_query, path, "query")
+def _check_query_like(raw_query: Any, path: str, schema: dict, label: str) -> dict:
+    """校验 query / compare_query（两者结构相同）。
+
+    非空 body、非空 project，投影变量必须在 body 中出现。
+    """
+    query_obj = _require_object(raw_query, path, label)
     _reject_extra_keys(query_obj, _QUERY_KEYS, path)
     if "body" not in query_obj:
-        raise ValidationError("query 缺少字段 body", f"{path}.body")
+        raise ValidationError(f"{label} 缺少字段 body", f"{path}.body")
     if "project" not in query_obj:
-        raise ValidationError("query 缺少字段 project", f"{path}.project")
+        raise ValidationError(f"{label} 缺少字段 project", f"{path}.project")
 
     body = query_obj["body"]
     if not isinstance(body, list) or len(body) == 0:
-        raise ValidationError("query body 必须是非空数组", f"{path}.body")
+        raise ValidationError(f"{label} body 必须是非空数组", f"{path}.body")
     for bi, atom in enumerate(body):
         _check_atom(atom, f"{path}.body[{bi}]", schema, allow_vars=True)
 
     project = query_obj["project"]
     if not isinstance(project, list) or len(project) == 0:
-        raise ValidationError("project 必须是非空数组", f"{path}.project")
+        raise ValidationError(f"{label} project 必须是非空数组", f"{path}.project")
 
     body_vars: set[str] = set()
     for atom in body:
@@ -283,7 +288,8 @@ def _check_query(raw_query: Any, schema: dict) -> dict:
             )
         if var not in body_vars:
             raise ValidationError(
-                f"投影变量 {var!r} 未在 query body 中出现", f"{path}.project[{i}]"
+                f"投影变量 {var!r} 未在 {label} body 中出现",
+                f"{path}.project[{i}]",
             )
     return {"body": [dict(a) for a in body], "project": list(project)}
 
@@ -307,6 +313,24 @@ def validate(payload: Any) -> dict:
         facts.append({"rel": raw_fact["rel"], "args": list(raw_fact["args"])})
 
     rules = _check_rules(root["rules"], schema)
-    query = _check_query(root["query"], schema)
+    query = _check_query_like(root["query"], "$.query", schema, "query")
 
-    return {"schema": schema, "facts": facts, "rules": rules, "query": query}
+    compare_query = None
+    if "compare_query" in root:
+        compare_query = _check_query_like(
+            root["compare_query"], "$.compare_query", schema, "compare_query"
+        )
+        if len(compare_query["project"]) != len(query["project"]):
+            raise ValidationError(
+                f"compare_query 投影长度 {len(compare_query['project'])} 与 "
+                f"query 投影长度 {len(query['project'])} 不一致",
+                "$.compare_query.project",
+            )
+
+    return {
+        "schema": schema,
+        "facts": facts,
+        "rules": rules,
+        "query": query,
+        "compare_query": compare_query,
+    }
