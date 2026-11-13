@@ -30,7 +30,7 @@ _TOP_LEVEL_KEYS = {
 _SCHEMA_KEYS = {"arity", "ranks", "key"}
 _ATOM_KEYS = {"rel", "args"}
 _RULE_KEYS = {"body", "head", "alternatives"}
-_QUERY_KEYS = {"body", "project"}
+_QUERY_KEYS = {"body", "project", "aggregate"}
 
 
 def _is_name(value: Any) -> bool:
@@ -287,7 +287,21 @@ def _check_query(raw_query: Any, schema: dict) -> dict:
             raise ValidationError(
                 f"投影变量 {var!r} 未在 query body 中出现", f"{path}.project[{i}]"
             )
-    return {"body": [dict(a) for a in body], "project": list(project)}
+
+    # 可选 aggregate：目前只支持 "min_count"。**省略该字段**时查询只
+    # 返回常量必然答案（旧输入完全兼容）；字段一旦出现就必须恰为字符串
+    # "min_count"——任何其他取值（含显式 null、布尔/整数/数组等非字符串）
+    # 都定位到 $.query.aggregate 整次拒绝。用 ``in`` 区分“省略”与
+    # “显式 null”，后者并非省略，不能按兼容路径放行。
+    normalized = {"body": [dict(a) for a in body], "project": list(project)}
+    if "aggregate" in query_obj:
+        aggregate = query_obj["aggregate"]
+        if not isinstance(aggregate, str) or aggregate != "min_count":
+            raise ValidationError(
+                "aggregate 只支持取值 \"min_count\"", f"{path}.aggregate"
+            )
+        normalized["aggregate"] = "min_count"
+    return normalized
 
 
 def _check_closed_relations(raw: Any, schema: dict) -> list[str]:

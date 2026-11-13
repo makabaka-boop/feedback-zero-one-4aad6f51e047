@@ -67,6 +67,8 @@ rank 安全（逐原子沿用：共有变量目标列 rank 不低于其 body 最
 
 from __future__ import annotations
 
+from typing import Any
+
 from .errors import InconsistentError
 
 # 内部表示约定：
@@ -621,20 +623,92 @@ class ChaseEngine:
         只保留每个分量都是输入事实常量（即规范化后为 ``("c", ...)``）
         的投影元组；匿名空对象不能作为答案。按 UTF-8 字节序排序去重。
         """
+        results = self.projected_tuples(query)
+        constant_only = {
+            t for t in results if all(kind == "c" for kind, _ in t)
+        }
+        return sorted(
+            (tuple(payload for _, payload in t) for t in constant_only),
+            key=lambda t: tuple(s.encode("utf-8") for s in t),
+        )
+
+    def projected_tuples(self, query: dict) -> set[tuple]:
+        """求查询绑定经 project 投影、按**实际身份**去重后的元组集合。
+
+        与 :meth:`answer_query` 不同，匿名空对象同样计数：每个投影分量
+        先经并查集规范化，空对象按其规范化代表（``("n", 根 id)``）比较，
+        常量按 ``("c", 字符串)`` 比较。绑定到同一常量（或合并为同一
+        等价类）的不同匿名编号在此只算一个身份——计数必须基于规范化
+        身份，不能直接数 chase 生成的匿名编号，也不能数只含常量的
+        answers。
+        """
         matches = self._eval_body(query["body"])
-        results: set[tuple[str, ...]] = set()
+        results: set[tuple] = set()
         for binding in matches:
-            out: list[str] = []
-            all_const = True
-            for var in query["project"]:
-                val = self.uf.canon(binding[var])
-                if val[0] != "c":
-                    all_const = False
-                    break
-                out.append(val[1])
-            if all_const:
-                results.add(tuple(out))
-        return sorted(results, key=lambda t: tuple(s.encode("utf-8") for s in t))
+            results.add(
+                tuple(self.uf.canon(binding[var]) for var in query["project"])
+            )
+        return results
+
+
+def advance_branch(branch: ChaseEngine) -> tuple[str, Any]:
+    """把一个 chase 分支向前推进**一步**。
+
+    返回 ``(状态, 载荷)``：
+
+    * ``("dead", None)``：分支触发常量冲突，不可能对应任何合法世界；
+    * ``("final", branch)``：已收敛且不存在未满足的析取绑定，本分支
+      即一个合法世界（canonical model）；
+    * ``("split", children)``：分支在一个分裂点上展开为若干自洽子分支
+      （封闭关系多候选见证，或析取规则的方案展开），交由外层入栈。
+
+    抽成独立函数是为了让“先强制识别两个对象、再把 chase 跑到不动点”
+    的聚合计算复用同一套收敛/分裂语义，而不是只在已生成结果上做合并。
+    """
+    # 优先消费挂起的封闭关系多候选：每个候选一个子分支。挂起元组
+    # 中的存在对象在**每个子分支内**替换为该分支私有的新空对象
+    # （并查集、实例元组、Skolem 缓存键与值同步重映射），使各候选
+    # 的见证身份显式独立；随后绑定该候选见证，常量冲突即丢弃该
+    # 子分支。
+    if branch.pending is not None:
+        rel, raw_tuple, candidates = branch.pending
+        branch.pending = None
+        suspended_nulls = [v[1] for v in raw_tuple if v[0] == "n"]
+        children: list[ChaseEngine] = []
+        for fact_tuple in candidates:
+            child = branch.clone()
+            id_map = child._remap_nulls_fresh(set(suspended_nulls))
+            child_tuple = tuple(
+                ("n", id_map[v[1]]) if v[0] == "n" else v
+                for v in raw_tuple
+            )
+            try:
+                child._bind_closed_witness(child_tuple, fact_tuple)
+            except InconsistentError:
+                continue
+            children.append(child)
+        return "split", children
+
+    try:
+        branch.stabilize()
+    except InconsistentError:
+        # 该分支不可能对应任何合法世界。
+        return "dead", None
+    except _Suspended:
+        # 确定性规则触发封闭关系多候选：同分支带着挂起信息再走一步，
+        # 下一轮按候选分裂（已完成的合并/元组变化都保留在分支上）。
+        return "split", [branch]
+
+    todo = branch.next_unsatisfied_alternative()
+    if todo is None:
+        return "final", branch
+    rule_idx, binding = todo
+    children = []
+    for alt in branch.rules[rule_idx]["alternatives"]:
+        # 每个方案一次性展开：开放原子写入 + 封闭原子见证组合；
+        # 无自洽见证组合时返回空列表，该方案对当前绑定整体失效。
+        children.extend(branch.expand_alternative(alt, binding))
+    return "split", children
 
 
 def chase_all(
@@ -656,49 +730,11 @@ def chase_all(
     final: list[ChaseEngine] = []
     stack = [ChaseEngine(schema, facts, rules, closed_relations)]
     while stack:
-        branch = stack.pop()
-
-        # 优先消费挂起的封闭关系多候选：每个候选一个子分支。挂起元组
-        # 中的存在对象在**每个子分支内**替换为该分支私有的新空对象
-        # （并查集、实例元组、Skolem 缓存键与值同步重映射），使各候选
-        # 的见证身份显式独立；随后绑定该候选见证，常量冲突即丢弃该
-        # 子分支。
-        if branch.pending is not None:
-            rel, raw_tuple, candidates = branch.pending
-            branch.pending = None
-            suspended_nulls = [v[1] for v in raw_tuple if v[0] == "n"]
-            for fact_tuple in candidates:
-                child = branch.clone()
-                id_map = child._remap_nulls_fresh(set(suspended_nulls))
-                child_tuple = tuple(
-                    ("n", id_map[v[1]]) if v[0] == "n" else v
-                    for v in raw_tuple
-                )
-                try:
-                    child._bind_closed_witness(child_tuple, fact_tuple)
-                except InconsistentError:
-                    continue
-                stack.append(child)
+        status, payload = advance_branch(stack.pop())
+        if status == "dead":
             continue
-
-        try:
-            branch.stabilize()
-        except InconsistentError:
-            continue  # 该分支不可能对应任何合法世界
-        except _Suspended:
-            # 确定性规则触发封闭关系多候选：同分支带着挂起信息回栈，
-            # 下一轮按候选分裂（已完成的合并/元组变化都保留在分支上）。
-            stack.append(branch)
-            continue
-
-        todo = branch.next_unsatisfied_alternative()
-        if todo is None:
-            final.append(branch)
-            continue
-        rule_idx, binding = todo
-        for alt in branch.rules[rule_idx]["alternatives"]:
-            # 每个方案一次性展开：开放原子写入 + 封闭原子见证组合；
-            # 无自洽见证组合时返回空列表，该方案对当前绑定整体失效。
-            children = branch.expand_alternative(alt, binding)
-            stack.extend(children)
+        if status == "final":
+            final.append(payload)
+        else:
+            stack.extend(payload)
     return final

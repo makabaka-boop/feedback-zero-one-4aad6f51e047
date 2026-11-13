@@ -1798,6 +1798,517 @@ class TestClosedRelationsValidation(unittest.TestCase):
         self.assertRejects(p, "unexpected")
 
 
+def _atom(rel, *args):
+    return {"rel": rel, "args": list(args)}
+
+
+class TestMinCountHeadline(unittest.TestCase):
+    """题面规定例：仅 A(a)、A(b)，A(x)->R(x,y)，查询 R 投影 y。
+
+    两个 Skolem 见证在合法世界中允许是同一对象，故最小身份数为 1；
+    但没有任何分量全为输入常量的必然元组，answers 必须仍为空。
+    """
+
+    def _payload(self, **query_overrides):
+        query = {
+            "body": [_atom("R", "x", "y")],
+            "project": ["y"],
+            "aggregate": "min_count",
+        }
+        query.update(query_overrides)
+        return {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                R=(2, [0, 1], [0]),
+            ),
+            "facts": [
+                {"rel": "A", "args": ["a"]},
+                {"rel": "A", "args": ["b"]},
+            ],
+            "rules": [
+                {
+                    "body": [_atom("A", "x")],
+                    "head": _atom("R", "x", "y"),
+                }
+            ],
+            "query": query,
+        }
+
+    def test_headline_min_count_is_one_with_empty_answers(self):
+        result = solve(self._payload())
+        self.assertEqual(
+            result,
+            {"status": "ok", "answers": [], "min_count": "1"},
+        )
+
+    def test_min_count_is_decimal_string_not_integer(self):
+        result = solve(self._payload())
+        self.assertIsInstance(result["min_count"], str)
+        self.assertTrue(result["min_count"].isdecimal())
+
+    def test_omitting_aggregate_keeps_legacy_report(self):
+        payload = self._payload()
+        del payload["query"]["aggregate"]
+        self.assertEqual(solve(payload), {"status": "ok", "answers": []})
+
+    def test_original_report_is_preserved_alongside_min_count(self):
+        # 追加 min_count 不得改动 answers 的计算方式与排序。投影两列时
+        # x 分别是常量 a、b（永不相等），两个投影元组身份必然不同，
+        # 故 min_count=2；answers 仍只收常量元组而此处 y 匿名 -> 空。
+        payload = self._payload(project=["x", "y"])
+        result = solve(payload)
+        self.assertEqual(result["answers"], [])
+        self.assertEqual(result["min_count"], "2")
+
+
+class TestMinCountWitnessReuse(unittest.TestCase):
+    """见证可跨规则触发/绑定复用：不同 Skolem 编号允许识别为同一身份。"""
+
+    def test_two_bindings_share_one_witness_under_partial_key(self):
+        # R 以首列为键：两行 R(a,s)、R(b,s) 的键不同，合并两个见证
+        # 不违反任何约束 -> 投影 y 最小只有 1 个身份。
+        payload = {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                R=(2, [0, 1], [0]),
+            ),
+            "facts": [
+                {"rel": "A", "args": ["a"]},
+                {"rel": "A", "args": ["b"]},
+            ],
+            "rules": [
+                {"body": [_atom("A", "x")], "head": _atom("R", "x", "y")}
+            ],
+            "query": {
+                "body": [_atom("R", "x", "y")],
+                "project": ["y"],
+                "aggregate": "min_count",
+            },
+        }
+        self.assertEqual(solve(payload)["min_count"], "1")
+
+    def test_full_key_still_allows_witness_reuse_when_keys_distinct(self):
+        # 全键也不阻止复用：键含 x 列，a、b 不同，合并 y 后两行键仍不同。
+        payload = {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                R=(2, [0, 1], [0, 1]),
+            ),
+            "facts": [
+                {"rel": "A", "args": ["a"]},
+                {"rel": "A", "args": ["b"]},
+            ],
+            "rules": [
+                {"body": [_atom("A", "x")], "head": _atom("R", "x", "y")}
+            ],
+            "query": {
+                "body": [_atom("R", "x", "y")],
+                "project": ["y"],
+                "aggregate": "min_count",
+            },
+        }
+        self.assertEqual(solve(payload)["min_count"], "1")
+
+    def test_witness_can_equal_input_constant(self):
+        # 存在见证允许等于输入常量：R(a,k) 事实把见证钉到 k，
+        # 投影身份数按常量计为 1，且 answers 含该常量元组。
+        payload = {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                R=(2, [0, 1], [0]),
+            ),
+            "facts": [
+                {"rel": "A", "args": ["a"]},
+                {"rel": "R", "args": ["a", "k"]},
+            ],
+            "rules": [
+                {"body": [_atom("A", "x")], "head": _atom("R", "x", "y")}
+            ],
+            "query": {
+                "body": [_atom("R", "x", "y")],
+                "project": ["y"],
+                "aggregate": "min_count",
+            },
+        }
+        result = solve(payload)
+        self.assertEqual(result["min_count"], "1")
+        self.assertEqual(result["answers"], [["k"]])
+
+
+class TestMinCountMergeTriggersJoin(unittest.TestCase):
+    """身份识别引发的新规则匹配必须重新 chase，不能只合并已生成结果。"""
+
+    def test_identifying_witnesses_enables_join_then_binds_constant(self):
+        # 两个绑定各造 R(a,匿名u)、R(b,匿名v)；事实 R(a,k) 经键把 u 钉为
+        # k。把 v 识别为 u(=k) 后，两条 R 都与 S(k,z1) 连接成功——识别的
+        # 后果在重新 chase 后才显现，投影 y 最小为 1，且 answers 含 k。
+        payload = {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                R=(2, [0, 1], [0]),
+                S=(2, [1, 1], [0, 1]),
+                T=(2, [1, 1], [0, 1]),
+            ),
+            "facts": [
+                {"rel": "A", "args": ["a"]},
+                {"rel": "A", "args": ["b"]},
+                {"rel": "R", "args": ["a", "k"]},
+                {"rel": "S", "args": ["k", "z1"]},
+            ],
+            "rules": [
+                {"body": [_atom("A", "x")], "head": _atom("R", "x", "y")},
+                {
+                    "body": [_atom("R", "x", "y"), _atom("S", "y", "z")],
+                    "head": _atom("T", "x", "z"),
+                },
+            ],
+            "query": {
+                "body": [_atom("R", "x", "y")],
+                "project": ["y"],
+                "aggregate": "min_count",
+            },
+        }
+        result = solve(payload)
+        self.assertEqual(result["min_count"], "1")
+        self.assertEqual(result["answers"], [["k"]])
+
+    def test_closed_relation_blocks_identification_within_branch(self):
+        # 同一分支内两个见证分别被单候选封闭关系钉到不同常量 d1、d2；
+        # 识别它们会要求 d1=d2（不同字符串常量永不相等）-> 该识别不可
+        # 满足，最小身份数保持 2。
+        payload = {
+            "schema": _schema_r(
+                A1=(1, [0], [0]),
+                A2=(1, [0], [0]),
+                H1=(2, [1, 2], [0, 1]),
+                H2=(2, [1, 2], [0, 1]),
+                D1=(1, [2], [0]),
+                D2=(1, [2], [0]),
+                K=(1, [2], [0]),
+            ),
+            "facts": [
+                {"rel": "A1", "args": ["a"]},
+                {"rel": "A2", "args": ["b"]},
+                {"rel": "D1", "args": ["d1"]},
+                {"rel": "D2", "args": ["d2"]},
+            ],
+            "rules": [
+                {"body": [_atom("A1", "x")], "head": _atom("H1", "x", "u")},
+                {"body": [_atom("A2", "x")], "head": _atom("H2", "x", "v")},
+                {"body": [_atom("H1", "x", "u")], "head": _atom("D1", "u")},
+                {"body": [_atom("H2", "x", "v")], "head": _atom("D2", "v")},
+                {"body": [_atom("H1", "x", "u")], "head": _atom("K", "u")},
+                {"body": [_atom("H2", "x", "v")], "head": _atom("K", "v")},
+            ],
+            "query": {
+                "body": [_atom("K", "y")],
+                "project": ["y"],
+                "aggregate": "min_count",
+            },
+            "closed_relations": ["D1", "D2"],
+        }
+        result = solve(payload)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["min_count"], "2")
+        self.assertEqual(result["answers"], [["d1"], ["d2"]])
+
+
+class TestMinCountKeyForcesSeparation(unittest.TestCase):
+    """键约束把两个见证分别钉到不同常量，迫使身份分离。"""
+
+    def test_distinct_constant_bindings_cannot_be_identified(self):
+        payload = {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                P=(2, [0, 1], [0]),
+                Q=(2, [0, 1], [0]),
+                H=(1, [1], [0]),
+            ),
+            "facts": [
+                {"rel": "A", "args": ["a"]},
+                {"rel": "P", "args": ["a", "p"]},
+                {"rel": "Q", "args": ["a", "q"]},
+            ],
+            "rules": [
+                {"body": [_atom("A", "x")], "head": _atom("P", "x", "u")},
+                {"body": [_atom("A", "x")], "head": _atom("Q", "x", "v")},
+                {"body": [_atom("P", "x", "u")], "head": _atom("H", "u")},
+                {"body": [_atom("Q", "x", "v")], "head": _atom("H", "v")},
+            ],
+            "query": {
+                "body": [_atom("H", "w")],
+                "project": ["w"],
+                "aggregate": "min_count",
+            },
+        }
+        result = solve(payload)
+        self.assertEqual(result["min_count"], "2")
+        self.assertEqual(result["answers"], [["p"], ["q"]])
+
+    def test_anonymous_ids_are_not_counted_directly(self):
+        # 同一规则对两个绑定各造一个 Skolem 编号；若直接数编号会得到 2，
+        # 但没有任何键/封闭约束阻止二者识别，min_count 必须为 1。
+        payload = {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                R=(2, [0, 1], [0, 1]),
+            ),
+            "facts": [
+                {"rel": "A", "args": ["a"]},
+                {"rel": "A", "args": ["b"]},
+            ],
+            "rules": [
+                {"body": [_atom("A", "x")], "head": _atom("R", "x", "y")}
+            ],
+            "query": {
+                "body": [_atom("R", "x", "y")],
+                "project": ["y"],
+                "aggregate": "min_count",
+            },
+        }
+        self.assertEqual(solve(payload)["min_count"], "1")
+
+
+class TestMinCountDisjunctiveBranchSwitch(unittest.TestCase):
+    """析取产生多个合法世界，min_count 取全部存活分支的最小基数。"""
+
+    def _payload(self):
+        return {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                Hh=(2, [1, 2], [0, 1]),
+                Dd=(1, [2], [0]),
+            ),
+            "facts": [
+                {"rel": "A", "args": ["a"]},
+                {"rel": "A", "args": ["b"]},
+                {"rel": "Dd", "args": ["d1"]},
+                {"rel": "Dd", "args": ["d2"]},
+            ],
+            "rules": [
+                {
+                    "body": [_atom("A", "x")],
+                    "alternatives": [
+                        [_atom("Hh", "x", "y")],
+                        [_atom("Hh", "x", "y"), _atom("Dd", "y")],
+                    ],
+                }
+            ],
+            "query": {
+                "body": [_atom("Hh", "x", "y")],
+                "project": ["y"],
+                "aggregate": "min_count",
+            },
+            "closed_relations": ["Dd"],
+        }
+
+    def test_branch_sizes_differ_and_minimum_is_taken(self):
+        from chase_backend.engine import chase_all
+
+        payload = self._payload()
+        branches = chase_all(
+            payload["schema"],
+            payload["facts"],
+            payload["rules"],
+            payload["closed_relations"],
+        )
+        sizes = {
+            len(
+                b.projected_tuples(
+                    {"body": payload["query"]["body"],
+                     "project": payload["query"]["project"]}
+                )
+            )
+            for b in branches
+        }
+        # 封闭方案按 d1/d2 候选分裂出基数 2 的分支，自由方案分支可合并
+        # 到基数 1：分支间确有差异，全局取最小。
+        self.assertTrue({1, 2} <= sizes, sizes)
+        self.assertEqual(solve(payload)["min_count"], "1")
+
+    def test_all_branches_conflicting_still_reports_inconsistent_only(self):
+        # 让封闭方案无见证、且只保留封闭方案 -> 无合法世界 -> 只报
+        # inconsistent，不允许附带 min_count。
+        payload = self._payload()
+        payload["facts"] = [
+            {"rel": "A", "args": ["a"]},
+            {"rel": "A", "args": ["b"]},
+        ]
+        payload["rules"][0]["alternatives"] = [
+            [_atom("Hh", "x", "y"), _atom("Dd", "y")]
+        ]
+        self.assertEqual(solve(payload), {"status": "inconsistent"})
+
+
+class TestMinCountEmptyFacts(unittest.TestCase):
+    def test_empty_facts_counts_zero(self):
+        payload = {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                R=(2, [0, 1], [0]),
+            ),
+            "facts": [],
+            "rules": [
+                {"body": [_atom("A", "x")], "head": _atom("R", "x", "y")}
+            ],
+            "query": {
+                "body": [_atom("R", "x", "y")],
+                "project": ["y"],
+                "aggregate": "min_count",
+            },
+        }
+        self.assertEqual(
+            solve(payload),
+            {"status": "ok", "answers": [], "min_count": "0"},
+        )
+
+    def test_zero_is_a_decimal_string(self):
+        payload = {
+            "schema": _schema_r(Q=(1, [0], [0])),
+            "facts": [],
+            "rules": [],
+            "query": {
+                "body": [_atom("Q", "x")],
+                "project": ["x"],
+                "aggregate": "min_count",
+            },
+        }
+        result = solve(payload)
+        self.assertEqual(result["min_count"], "0")
+        self.assertIsInstance(result["min_count"], str)
+
+
+class TestMinCountValidation(unittest.TestCase):
+    """aggregate 字段的校验与定位 $.query.aggregate。"""
+
+    def _base(self):
+        return {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                R=(2, [0, 1], [0]),
+            ),
+            "facts": [{"rel": "A", "args": ["a"]}],
+            "rules": [
+                {"body": [_atom("A", "x")], "head": _atom("R", "x", "y")}
+            ],
+            "query": {
+                "body": [_atom("R", "x", "y")],
+                "project": ["y"],
+            },
+        }
+
+    def assertRejects(self, payload, path_suffix):
+        with self.assertRaises(ValidationError) as ctx:
+            solve(payload)
+        self.assertTrue(
+            ctx.exception.path.endswith(path_suffix),
+            f"路径 {ctx.exception.path!r} 应以 {path_suffix!r} 结尾",
+        )
+
+    def test_min_count_value_accepted(self):
+        p = self._base()
+        p["query"]["aggregate"] = "min_count"
+        self.assertEqual(solve(p)["status"], "ok")
+
+    def test_unknown_aggregate_string_rejected_at_query_aggregate(self):
+        for bad in ("MAX", "count", "min-count", ""):
+            p = self._base()
+            p["query"]["aggregate"] = bad
+            self.assertRejects(p, "query.aggregate")
+
+    def test_non_string_aggregate_rejected_at_query_aggregate(self):
+        for bad in (123, True, None, [], {}):
+            p = self._base()
+            if bad is None:
+                p["query"]["aggregate"] = None
+            else:
+                p["query"]["aggregate"] = bad
+            # None 是显式 null：应作为非法值定位到 aggregate，
+            # 而不是按“省略字段”兼容处理。
+            self.assertRejects(p, "query.aggregate")
+
+    def test_omitted_aggregate_is_legal(self):
+        self.assertNotIn("aggregate", self._base()["query"])
+        self.assertEqual(
+            solve(self._base()), {"status": "ok", "answers": []}
+        )
+
+
+class TestMinCountCLI(unittest.TestCase):
+    """原文件入口接入 aggregate：成功落盘 min_count；非法值保留旧文件。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="chase-mincount-")
+        self.input_path = os.path.join(self.tmp, "in.json")
+        self.output_path = os.path.join(self.tmp, "out.json")
+
+    def _run_cli(self):
+        proc = subprocess.run(
+            [sys.executable, "-m", "chase_backend",
+             self.input_path, self.output_path],
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        return proc
+
+    def test_min_count_written_through_cli(self):
+        payload = {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                R=(2, [0, 1], [0]),
+            ),
+            "facts": [
+                {"rel": "A", "args": ["a"]},
+                {"rel": "A", "args": ["b"]},
+            ],
+            "rules": [
+                {"body": [_atom("A", "x")], "head": _atom("R", "x", "y")}
+            ],
+            "query": {
+                "body": [_atom("R", "x", "y")],
+                "project": ["y"],
+                "aggregate": "min_count",
+            },
+        }
+        with open(self.input_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False)
+        proc = self._run_cli()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(self.output_path, encoding="utf-8") as fh:
+            self.assertEqual(
+                json.load(fh),
+                {"status": "ok", "answers": [], "min_count": "1"},
+            )
+
+    def test_invalid_aggregate_keeps_old_output(self):
+        old_result = {"status": "ok", "answers": [["OLD"]]}
+        atomic_write_json(self.output_path, old_result)
+        bad = {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                R=(2, [0, 1], [0]),
+            ),
+            "facts": [{"rel": "A", "args": ["a"]}],
+            "rules": [
+                {"body": [_atom("A", "x")], "head": _atom("R", "x", "y")}
+            ],
+            "query": {
+                "body": [_atom("R", "x", "y")],
+                "project": ["y"],
+                "aggregate": "MAX",
+            },
+        }
+        with open(self.input_path, "w", encoding="utf-8") as fh:
+            json.dump(bad, fh, ensure_ascii=False)
+        proc = self._run_cli()
+        self.assertNotEqual(proc.returncode, 0)
+        err = json.loads(proc.stderr)
+        self.assertTrue(err["path"].endswith("query.aggregate"))
+        with open(self.output_path, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh), old_result)
+
+
 class TestClosedRelationsCLI(unittest.TestCase):
     """原文件入口接入 closed_relations；非法声明整次拒绝并保留旧文件。"""
 

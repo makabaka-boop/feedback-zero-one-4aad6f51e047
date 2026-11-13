@@ -14,14 +14,17 @@
 │   ├── __main__.py           # 命令行入口 python -m chase_backend
 │   ├── validator.py          # 完整输入校验（错误带 JSON 字段路径）
 │   ├── engine.py             # chase 引擎：并查集 + Skolem 空对象 + 键合并 + 析取分支 + 封闭关系见证
-│   ├── solver.py             # 校验 -> chase -> 查询 的编排
+│   ├── aggregation.py        # aggregate="min_count"：身份识别后重新 chase 求最小投影基数
+│   ├── solver.py             # 校验 -> chase -> 查询/聚合 的编排
 │   ├── io_utils.py           # 原子写入（临时文件 + os.replace）
 │   └── errors.py             # ValidationError / InconsistentError
 ├── tests/
-│   └── test_acceptance.py    # 独立验收（82 项，仅依赖 unittest）
+│   └── test_acceptance.py    # 独立验收（108 项，仅依赖 unittest）
 ├── examples/
 │   ├── spec_example.json                  # 题面示例输入
 │   ├── spec_example.expected.json         # 期望输出
+│   ├── min_count_example.json             # min_count 题面小例输入
+│   ├── min_count_example.expected.json    # 期望输出（answers=[]、min_count="1"）
 │   ├── alternatives_example.json          # 析取方案示例输入
 │   ├── alternatives_example.expected.json # 期望输出
 │   ├── closed_relations_example.json      # 封闭关系示例输入
@@ -74,6 +77,9 @@
     存在变量所在列的 rank 必须严格高于整个 body 所有位置的最高
     rank。
 * **query**：非空 `body` 与非空 `project`，投影变量必须在 body 出现。
+  可选 `aggregate`：省略时行为与旧版本完全一致；取值目前只支持字符串
+  `"min_count"`，任何其他取值（含显式 `null`、非字符串）都定位到
+  `$.query.aggregate` 整次拒绝。
 * **closed_relations（可选）**：无重复关系名的数组，**允许空数组**；
   省略该字段时所有关系保持开放，旧输入完全兼容。每项必须是非空
   ASCII 字母数字串且引用已在 schema 声明的关系；非法项带零基下标
@@ -114,6 +120,40 @@
   **输入事实常量**的投影元组（匿名标识不能作为答案），去重后按
   **UTF-8 元组字典序**（逐分量比较 UTF-8 字节序列）排序。
 * `{"status": "inconsistent"}`：无合法世界。
+* 当 query 带 `"aggregate": "min_count"` 时，在上面的报告上**追加**
+  字段 `min_count`：一个十进制非负整数字符串（如 `"0"`、`"1"`），
+  原 `answers` 报告保持不变；无合法世界时仍只输出
+  `{"status": "inconsistent"}`，不附带 `min_count`。
+
+### min_count：身份未知时至少有多少条关联结果
+
+科研目录审核里，待确认对象的**实际身份未知**：chase 为不同规则触发、
+不同绑定各自造的匿名 Skolem 对象，在合法世界中允许是同一对象，也允许
+等于某个输入常量。`min_count` 回答“在所有合法世界中，查询投影至少要
+区分出多少个不同身份的关联结果”：
+
+1. 对每个合法世界按 query body 求全部同态绑定，经 `project` 投影后
+   按**实际身份**去重——匿名对象按并查集规范化后的代表身份计数，绑定
+   到同一常量（或合并为同一等价类）的不同 Skolem 编号只算一个；
+2. 取**所有合法世界**上该投影基数的最小值。
+
+因此既**不能数 `answers`**（匿名结果被整体丢弃，题面例中 answers 为
+空而 min_count 为 1），也**不能直接数 chase 的匿名编号**（不同编号允许
+相等，直接数必然高估）。
+
+身份识别不是任意的：每一次把两个自由空对象识别为同一对象、或识别为某
+个常量，都可能引发**新的规则匹配、键合并、析取方案选择与封闭关系
+见证**，这些后果必须全部自洽。实现上对每个存活 chase 分支枚举一步身份
+识别，然后**把 chase 重新跑到不动点**（复用同一套分裂/收敛语义），丢弃
+触发常量冲突或封闭关系无见证的识别方向；只在已经生成的结果上做合并是
+错误的。存在见证可跨规则、跨绑定复用，也可等于输入常量；键约束可迫使
+两个见证分离（分别钉到不同常量），析取产生的不同合法世界之间取最小。
+
+* 空事实（无任何查询匹配）计数为字符串 `"0"`；
+* 例：仅 `A(a)`、`A(b)`，`A`/`R` 的 rank 分别为 `[0]`/`[0,1]`、键均
+  `[0]`，唯一规则 `A(x)→R(x,y)`，查询 `R(x,y)` 投影 `y`：两个见证可
+  识别为同一对象，得 `min_count="1"`，而 `answers=[]`（见
+  `examples/min_count_example.json`）。
 
 ## 语义与算法
 
@@ -180,6 +220,25 @@ Skolem 对象由低 rank 的有限取值决定，也是有限的；键合并只�
 分量规范化后都是常量的元组；取**所有分支的交集**（即所有合法世界
 共有的答案），去重并按 UTF-8 字节序排序。
 
+### min_count 的搜索
+
+`aggregate="min_count"` 不经过“常量答案交集”，而是直接数**实际身份**：
+
+1. 在每个存活分支上对 query body 同态求值，投影分量经并查集规范化
+   （常量 `("c",…)`、空对象代表 `("n",根)`），元组按身份去重得到该
+   分支的投影基数；
+2. 从分支的 canonical model 出发，枚举一步身份识别——任意两个自由
+   空对象根合并，或某个自由空对象根绑定为实例中已有的常量；
+3. 识别后克隆分支并**重新完整 chase**（`advance_branch` 的封闭见证
+   分裂、析取方案分裂、键合并全部照常），触发常量冲突或封闭关系无
+   见证的方向被丢弃；
+4. 只继续探索投影基数严格下降的自洽延拓（身份只增粗、基数不反弹），
+   并以与 Skolem 命名无关的结构签名记忆化；取全部可达不动点上的最小
+   基数，跨所有初始存活分支再取最小。
+
+识别只在既有对象之间进行、不引入新名字，rank 安全又保证每个 chase
+分支有限，故搜索空间有限、必然终止。
+
 ## 使用方式
 
 ### 命令行（入口）
@@ -187,6 +246,9 @@ Skolem 对象由低 rank 的有限取值决定，也是有限的；键合并只�
 ```bash
 python -m chase_backend examples/spec_example.json /tmp/out.json
 cat /tmp/out.json
+
+# min_count 聚合：输出 {"status":"ok","answers":[],"min_count":"1"}
+python -m chase_backend examples/min_count_example.json /tmp/mc.json
 ```
 
 * 成功（含 `inconsistent` 这一正常结果）：退出码 0，输出文件被
@@ -216,7 +278,7 @@ python -I tests/test_acceptance.py
 python -m unittest discover -s tests -t .
 ```
 
-覆盖场景（82 项）：
+覆盖场景（108 项）：
 
 * 题面示例（缺关联对象经键合并补回必然答案）及无确定答案对照组；
 * 递归：传递闭包、带环图终止与去重；
@@ -238,6 +300,14 @@ python -m unittest discover -s tests -t .
   封闭绑定经键合并触发新匹配、匿名元组整体对应（禁止逐列拼接）、
   析取方案部分失效与全部失效、空事实、省略/空数组兼容、非法声明
   定位到字段路径与零基数组下标；
+* 聚合 `aggregate="min_count"`：题面小例（`answers=[]` 且
+  `min_count="1"`）、十进制字符串类型、省略字段兼容、原 answers
+  报告保留、见证跨绑定/全键复用、见证等于输入常量、身份识别经重新
+  chase 触发新连接、封闭关系在同一分支内阻止识别、键约束迫使见证
+  分离（不直接数匿名编号）、析取分支间基数切换取最小、全分支冲突仍
+  只报 inconsistent、空事实计数 `"0"`、非法 aggregate（含显式 null
+  与非字符串）定位 `$.query.aggregate` 整次拒绝；
 * CLI：成功原子替换、非法输入保留旧输出、`inconsistent` 正常落盘、
   输入缺失时不产生输出、alternatives 与 closed_relations 输入正常求解、
-  非法 closed_relations 声明保留旧文件。
+  非法 closed_relations 声明保留旧文件、min_count 正常落盘与非法
+  aggregate 保留旧文件。

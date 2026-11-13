@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .aggregation import minimum_count
 from .engine import chase_all
 from .validator import validate
 
@@ -16,8 +17,13 @@ def solve(payload: Any) -> dict:
     * ``{"status": "ok", "answers": [[...], ...]}`` —— 合法且求解成功，
       答案为所有合法世界（全部自洽 chase 分支）共有的常量投影元组，
       去重后按 UTF-8 元组字典序排列；
+    * 当 query 带 ``"aggregate": "min_count"`` 时，额外追加
+      ``"min_count"``：十进制非负整数字符串，表示在所有合法世界中，
+      查询投影按对象实际身份（匿名对象按并查集规范化代表，含与常量
+      的识别）去重后的最小基数；原 ``answers`` 报告保持不变；
     * ``{"status": "inconsistent"}`` —— 无任何合法世界（所有分支都
-      因键约束要求两个不同常量相等而冲突）。
+      因键约束要求两个不同常量相等而冲突）。聚合模式下同样只报
+      inconsistent，不附带 min_count。
 
     输入非法时抛出 :class:`~chase_backend.errors.ValidationError`，
     由调用方负责整次拒绝并保留旧输出。
@@ -42,4 +48,12 @@ def solve(payload: Any) -> dict:
         common if common is not None else set(),
         key=lambda t: tuple(s.encode("utf-8") for s in t),
     )
-    return {"status": "ok", "answers": [list(t) for t in ordered]}
+    result: dict[str, Any] = {
+        "status": "ok",
+        "answers": [list(t) for t in ordered],
+    }
+    if problem["query"].get("aggregate") == "min_count":
+        # 在全部存活分支及其自洽身份识别延拓上取最小投影基数；
+        # 空事实（无任何查询匹配）自然得到 0。
+        result["min_count"] = str(minimum_count(branches, problem["query"]))
+    return result
