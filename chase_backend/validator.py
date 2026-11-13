@@ -7,11 +7,14 @@
 * facts / rules / query 的关系引用与元数必须匹配；
 * 名称为非空 ASCII 字母数字串，常量为字符串（布尔/整数等一律拒绝，
   注意 Python 中 ``bool`` 是 ``int`` 子类，整数检查必须显式排除布尔）；
-* 规则的 rank 安全性：head 共有变量所在列 rank 不低于该变量任一 body
-  位置，head 存在变量所在列 rank 高于该变量全部 body 位置。
+* 规则结论为 ``head``（单原子）与 ``alternatives``（非空方案数组，
+  每项为非空原子数组）恰选一个；
+* 规则的 rank 安全性（对 head 或每个方案原子逐原子沿用）：结论共有
+  变量所在列 rank 不低于该变量任一 body 位置，结论存在变量所在列
+  rank 严格高于整个 body 所有位置的最高 rank。
 
-任何一处不合法都抛出 :class:`ValidationError`，错误信息带 JSON 路径，
-由上层整次拒绝、不产生新输出。
+任何一处不合法都抛出 :class:`ValidationError`，错误信息带 JSON 路径
+（数组下标为零基），由上层整次拒绝、不产生新输出。
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ from .errors import ValidationError
 _TOP_LEVEL_KEYS = {"schema", "facts", "rules", "query"}
 _SCHEMA_KEYS = {"arity", "ranks", "key"}
 _ATOM_KEYS = {"rel", "args"}
-_RULE_KEYS = {"body", "head"}
+_RULE_KEYS = {"body", "head", "alternatives"}
 _QUERY_KEYS = {"body", "project"}
 
 
@@ -150,6 +153,43 @@ def _check_schema(raw_schema: Any) -> dict:
     return schema
 
 
+def _check_rank_safety(
+    named_atoms: list[tuple[dict, str]],
+    body_ranks: dict[str, list[int]],
+    schema: dict,
+) -> None:
+    """对一组结论原子（head 单原子或某方案的全部原子）做 rank 安全检查。
+
+    ``named_atoms`` 为 ``(原子, 原子路径)`` 对，路径用于定位错误（零基
+    数组下标）。共有变量目标列 rank 不得低于该变量任一 body 位置；
+    存在变量目标列 rank 必须严格高于整个 body 所有位置的最高 rank。
+    """
+    # body 非空且元数 >= 1，body_ranks 必然非空。
+    max_body_all = max(max(v) for v in body_ranks.values())
+    for atom, atom_path in named_atoms:
+        ranks = schema[atom["rel"]]["ranks"]
+        for col, var in enumerate(atom["args"]):
+            hr = ranks[col]
+            arg_path = f"{atom_path}.args[{col}]"
+            if var in body_ranks:
+                # 共有变量：目标列 rank 不得低于任一 body 位置。
+                max_body = max(body_ranks[var])
+                if hr < max_body:
+                    raise ValidationError(
+                        f"共有变量 {var!r} 的目标列 rank({hr}) 低于其 "
+                        f"body 位置最高 rank({max_body})",
+                        arg_path,
+                    )
+            else:
+                # 存在变量：目标列 rank 必须高于整个 body 的最高 rank。
+                if hr <= max_body_all:
+                    raise ValidationError(
+                        f"存在变量 {var!r} 的目标列 rank({hr}) 必须严格高于"
+                        f"整个 body 所有位置的最高 rank({max_body_all})",
+                        arg_path,
+                    )
+
+
 def _check_rules(raw_rules: Any, schema: dict) -> list[dict]:
     if not isinstance(raw_rules, list):
         raise ValidationError("rules 必须是数组", "$.rules")
@@ -160,8 +200,18 @@ def _check_rules(raw_rules: Any, schema: dict) -> list[dict]:
         _reject_extra_keys(rule_obj, _RULE_KEYS, path)
         if "body" not in rule_obj:
             raise ValidationError("规则缺少字段 body", f"{path}.body")
-        if "head" not in rule_obj:
-            raise ValidationError("规则缺少字段 head", f"{path}.head")
+        has_head = "head" in rule_obj
+        has_alts = "alternatives" in rule_obj
+        if has_head and has_alts:
+            raise ValidationError(
+                "head 与 alternatives 必须恰选一个，不能同时出现",
+                f"{path}.alternatives",
+            )
+        if not has_head and not has_alts:
+            raise ValidationError(
+                "规则缺少字段 head 或 alternatives（两者恰选一个）",
+                f"{path}.head",
+            )
 
         body = rule_obj["body"]
         if not isinstance(body, list) or len(body) == 0:
@@ -169,10 +219,6 @@ def _check_rules(raw_rules: Any, schema: dict) -> list[dict]:
         for bi, atom in enumerate(body):
             _check_atom(atom, f"{path}.body[{bi}]", schema, allow_vars=True)
 
-        head = rule_obj["head"]
-        _check_atom(head, f"{path}.head", schema, allow_vars=True)
-
-        # rank 安全性检查。
         # 收集每个变量在 body 各位置出现的列 rank。
         body_ranks: dict[str, list[int]] = {}
         for atom in body:
@@ -181,39 +227,30 @@ def _check_rules(raw_rules: Any, schema: dict) -> list[dict]:
             for col, var in enumerate(atom["args"]):
                 body_ranks.setdefault(var, []).append(ranks[col])
 
-        head_rel = head["rel"]
-        head_ranks = schema[head_rel]["ranks"]
-        head_vars = set(head["args"])
-        for col, var in enumerate(head["args"]):
-            hr = head_ranks[col]
-            if var in body_ranks:
-                # 共有变量：head 列 rank 不得低于任一 body 位置。
-                max_body = max(body_ranks[var])
-                if hr < max_body:
-                    raise ValidationError(
-                        f"共有变量 {var!r} 的 head 列 rank({hr}) 低于其 "
-                        f"body 位置最高 rank({max_body})",
-                        f"{path}.head.args[{col}]",
-                    )
-            else:
-                # 存在变量：head 列 rank 必须高于全部 body 位置。
-                if not body_ranks:  # 理论上 body 非空，防御性判断
-                    raise ValidationError("规则 body 为空", path)
-                max_body = max(max(v) for v in body_ranks.values())
-                if hr <= max_body:
-                    raise ValidationError(
-                        f"存在变量 {var!r} 的 head 列 rank({hr}) 必须严格高于"
-                        f"全部 body 位置的最高 rank({max_body})",
-                        f"{path}.head.args[{col}]",
-                    )
-        # head 中未出现的 body 变量（见证变量）允许存在，不参与 head 约束。
-        del head_vars
-        rules.append(
-            {
-                "body": [dict(a) for a in body],
-                "head": dict(head),
-            }
-        )
+        norm_body = [dict(a) for a in body]
+        if has_head:
+            head = rule_obj["head"]
+            _check_atom(head, f"{path}.head", schema, allow_vars=True)
+            _check_rank_safety([(head, f"{path}.head")], body_ranks, schema)
+            rules.append({"body": norm_body, "head": dict(head)})
+        else:
+            alts = rule_obj["alternatives"]
+            alts_path = f"{path}.alternatives"
+            if not isinstance(alts, list) or len(alts) == 0:
+                raise ValidationError("alternatives 必须是非空数组", alts_path)
+            norm_alts: list[list[dict]] = []
+            named: list[tuple[dict, str]] = []
+            for ai, alt in enumerate(alts):
+                alt_path = f"{alts_path}[{ai}]"
+                if not isinstance(alt, list) or len(alt) == 0:
+                    raise ValidationError("方案必须是非空原子数组", alt_path)
+                for bi, atom in enumerate(alt):
+                    atom_path = f"{alt_path}[{bi}]"
+                    _check_atom(atom, atom_path, schema, allow_vars=True)
+                    named.append((atom, atom_path))
+                norm_alts.append([dict(a) for a in alt])
+            _check_rank_safety(named, body_ranks, schema)
+            rules.append({"body": norm_body, "alternatives": norm_alts})
     return rules
 
 

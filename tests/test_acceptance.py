@@ -16,7 +16,11 @@
 6. UTF-8 元组序排序与去重；
 7. 空事实；
 8. 非法输入字段定位与整次拒绝；
-9. 命令行入口：成功原子替换、失败保留旧结果、inconsistent 正常落盘。
+9. 命令行入口：成功原子替换、失败保留旧结果、inconsistent 正常落盘；
+10. 析取方案 alternatives：任务书析取例、不同匹配须选不同方案、
+    方案内共享见证、方案见证经键合并触发新匹配、部分方案冲突、
+    全部方案冲突、空事实，以及 alternatives 的非法结构/引用/rank
+    定位（零基数组下标）。
 """
 
 from __future__ import annotations
@@ -574,6 +578,403 @@ class TestValidation(unittest.TestCase):
         self.assertRejects(p, "query.project")
 
 
+class TestAlternativesSpecExample(unittest.TestCase):
+    """任务书析取例：A(a)，A(x)->B(x)或C(x)，B(x)->D(x)，C(x)->D(x)。"""
+
+    def _payload(self, query_rel):
+        return {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                B=(1, [0], [0]),
+                C=(1, [0], [0]),
+                D=(1, [0], [0]),
+            ),
+            "facts": [{"rel": "A", "args": ["a"]}],
+            "rules": [
+                {
+                    "body": [{"rel": "A", "args": ["x"]}],
+                    "alternatives": [
+                        [{"rel": "B", "args": ["x"]}],
+                        [{"rel": "C", "args": ["x"]}],
+                    ],
+                },
+                {
+                    "body": [{"rel": "B", "args": ["x"]}],
+                    "head": {"rel": "D", "args": ["x"]},
+                },
+                {
+                    "body": [{"rel": "C", "args": ["x"]}],
+                    "head": {"rel": "D", "args": ["x"]},
+                },
+            ],
+            "query": {
+                "body": [{"rel": query_rel, "args": ["x"]}],
+                "project": ["x"],
+            },
+        }
+
+    def test_conclusion_common_to_all_branches_is_certain(self):
+        # 两个分支分别选 B(a)/C(a)，都推出 D(a)，D 的投影必然成立。
+        self.assertEqual(
+            solve(self._payload("D")), {"status": "ok", "answers": [["a"]]}
+        )
+
+    def test_branch_local_choice_is_not_certain(self):
+        # B(a)/C(a) 各只在一个分支成立，都不是所有合法世界共有。
+        self.assertEqual(
+            solve(self._payload("B")), {"status": "ok", "answers": []}
+        )
+        self.assertEqual(
+            solve(self._payload("C")), {"status": "ok", "answers": []}
+        )
+
+
+class TestAlternativesForcedChoice(unittest.TestCase):
+    """不同 body 匹配被迫选择不同方案：a 只能选 F，b 只能选 E。"""
+
+    def _payload(self, query_rel):
+        return {
+            "schema": _schema_r(
+                P=(1, [0], [0]),
+                D=(2, [0, 0], [0]),
+                E=(2, [0, 0], [0]),
+                F=(2, [0, 0], [0]),
+            ),
+            "facts": [
+                {"rel": "P", "args": ["a"]},
+                {"rel": "P", "args": ["b"]},
+                {"rel": "D", "args": ["a", "m"]},
+                {"rel": "D", "args": ["b", "n"]},
+                {"rel": "E", "args": ["a", "e"]},
+                {"rel": "F", "args": ["b", "f"]},
+            ],
+            "rules": [
+                {
+                    "body": [
+                        {"rel": "P", "args": ["x"]},
+                        {"rel": "D", "args": ["x", "y"]},
+                    ],
+                    "alternatives": [
+                        [{"rel": "E", "args": ["x", "y"]}],
+                        [{"rel": "F", "args": ["x", "y"]}],
+                    ],
+                }
+            ],
+            "query": {
+                "body": [{"rel": query_rel, "args": ["x", "y"]}],
+                "project": ["x", "y"],
+            },
+        }
+
+    def test_each_match_picks_the_only_consistent_alternative(self):
+        # 绑定 (a,m)：选 E 会与事实 E(a,e) 同键冲突（要求 m=e），只能选
+        # F(a,m)；绑定 (b,n)：选 F 会与事实 F(b,f) 冲突（要求 n=f），
+        # 只能选 E(b,n)。唯一存活分支同时含两个推导结果。
+        self.assertEqual(
+            solve(self._payload("E"))["answers"], [["a", "e"], ["b", "n"]]
+        )
+        self.assertEqual(
+            solve(self._payload("F"))["answers"], [["a", "m"], ["b", "f"]]
+        )
+
+
+class TestAlternativeSharedWitness(unittest.TestCase):
+    """方案内未在 body 出现的同名变量共享同一存在对象。"""
+
+    def test_shared_existential_joins_within_alternative(self):
+        payload = {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                R=(2, [0, 1], [0, 1]),
+                S=(1, [1], [0]),
+            ),
+            "facts": [{"rel": "A", "args": ["a"]}],
+            "rules": [
+                {
+                    "body": [{"rel": "A", "args": ["x"]}],
+                    "alternatives": [
+                        [
+                            {"rel": "R", "args": ["x", "y"]},
+                            {"rel": "S", "args": ["y"]},
+                        ]
+                    ],
+                }
+            ],
+            "query": {
+                "body": [
+                    {"rel": "R", "args": ["x", "y"]},
+                    {"rel": "S", "args": ["y"]},
+                ],
+                "project": ["x"],
+            },
+        }
+        # y 在 R 与 S 中是同一个匿名对象，连接成立 -> x=a 确定。
+        self.assertEqual(solve(payload)["answers"], [["a"]])
+        # 但匿名对象本身不能作为答案。
+        payload["query"] = {
+            "body": [{"rel": "S", "args": ["y"]}],
+            "project": ["y"],
+        }
+        self.assertEqual(solve(payload)["answers"], [])
+
+
+class TestAlternativeKeyMergeTriggersMatch(unittest.TestCase):
+    """方案引入的匿名对象经键合并变成常量后，才触发新的连接匹配。"""
+
+    def _payload(self, query):
+        return {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                M=(2, [0, 1], [0]),
+                Q=(2, [0, 1], [0, 1]),
+                R=(2, [0, 1], [0]),
+                S=(2, [0, 1], [0, 1]),
+                T=(2, [0, 1], [0, 1]),
+            ),
+            "facts": [
+                {"rel": "A", "args": ["a"]},
+                {"rel": "R", "args": ["a", "k"]},
+                {"rel": "S", "args": ["k", "z1"]},
+            ],
+            "rules": [
+                # 两个方案都含 M(x,y)；方案 2 额外让同一 y 出现在 Q。
+                {
+                    "body": [{"rel": "A", "args": ["x"]}],
+                    "alternatives": [
+                        [{"rel": "M", "args": ["x", "y"]}],
+                        [
+                            {"rel": "M", "args": ["x", "y"]},
+                            {"rel": "Q", "args": ["x", "y"]},
+                        ],
+                    ],
+                },
+                # M(a, 匿名) 搬到 R，与事实 R(a,k) 同键 -> 匿名 = k
+                {
+                    "body": [{"rel": "M", "args": ["x", "y"]}],
+                    "head": {"rel": "R", "args": ["x", "y"]},
+                },
+                # 匿名合并成 k 后连接 S(k,z1) 才成立 -> T(a,z1)
+                {
+                    "body": [
+                        {"rel": "M", "args": ["x", "y"]},
+                        {"rel": "S", "args": ["y", "z"]},
+                    ],
+                    "head": {"rel": "T", "args": ["x", "z"]},
+                },
+            ],
+            "query": query,
+        }
+
+    def test_merge_enables_join_in_every_branch(self):
+        payload = self._payload(
+            {
+                "body": [{"rel": "T", "args": ["x", "z"]}],
+                "project": ["x", "z"],
+            }
+        )
+        self.assertEqual(solve(payload)["answers"], [["a", "z1"]])
+
+    def test_branch_local_atom_is_not_certain(self):
+        # Q 只在选了方案 2 的分支成立，并非所有合法世界共有。
+        payload = self._payload(
+            {
+                "body": [{"rel": "Q", "args": ["x", "y"]}],
+                "project": ["x"],
+            }
+        )
+        self.assertEqual(solve(payload)["answers"], [])
+
+
+class TestAlternativePartialConflict(unittest.TestCase):
+    """部分方案冲突：冲突方案的分支被丢弃，整题并非无解。"""
+
+    def test_conflicting_alternative_does_not_sink_the_problem(self):
+        payload = {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                B=(2, [0, 0], [0]),
+                E=(2, [0, 0], [0]),
+                F=(2, [0, 0], [0]),
+            ),
+            "facts": [
+                {"rel": "A", "args": ["a"]},
+                {"rel": "B", "args": ["a", "m"]},
+                {"rel": "E", "args": ["a", "e"]},
+            ],
+            "rules": [
+                {
+                    "body": [
+                        {"rel": "A", "args": ["x"]},
+                        {"rel": "B", "args": ["x", "y"]},
+                    ],
+                    "alternatives": [
+                        # 与事实 E(a,e) 同键冲突（要求 m=e），该分支被丢弃
+                        [{"rel": "E", "args": ["x", "y"]}],
+                        [{"rel": "F", "args": ["x", "y"]}],
+                    ],
+                }
+            ],
+            "query": {
+                "body": [{"rel": "F", "args": ["x", "y"]}],
+                "project": ["x", "y"],
+            },
+        }
+        self.assertEqual(
+            solve(payload), {"status": "ok", "answers": [["a", "m"]]}
+        )
+
+
+class TestAlternativeAllConflict(unittest.TestCase):
+    """全部方案都冲突 -> 没有任何合法世界 -> inconsistent。"""
+
+    def test_all_alternatives_conflicting_is_inconsistent(self):
+        payload = {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                B=(2, [0, 0], [0]),
+                E=(2, [0, 0], [0]),
+                F=(2, [0, 0], [0]),
+            ),
+            "facts": [
+                {"rel": "A", "args": ["a"]},
+                {"rel": "B", "args": ["a", "m"]},
+                {"rel": "E", "args": ["a", "e"]},
+                {"rel": "F", "args": ["a", "f"]},
+            ],
+            "rules": [
+                {
+                    "body": [
+                        {"rel": "A", "args": ["x"]},
+                        {"rel": "B", "args": ["x", "y"]},
+                    ],
+                    "alternatives": [
+                        [{"rel": "E", "args": ["x", "y"]}],  # 要求 m=e
+                        [{"rel": "F", "args": ["x", "y"]}],  # 要求 m=f
+                    ],
+                }
+            ],
+            "query": {
+                "body": [{"rel": "A", "args": ["x"]}],
+                "project": ["x"],
+            },
+        }
+        self.assertEqual(solve(payload), {"status": "inconsistent"})
+
+
+class TestAlternativeEmptyFacts(unittest.TestCase):
+    def test_empty_facts_no_binding_no_branching(self):
+        payload = {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                R=(2, [0, 1], [0]),
+                S=(2, [0, 1], [0]),
+            ),
+            "facts": [],
+            "rules": [
+                {
+                    "body": [{"rel": "A", "args": ["x"]}],
+                    "alternatives": [
+                        [{"rel": "R", "args": ["x", "y"]}],
+                        [{"rel": "S", "args": ["x", "y"]}],
+                    ],
+                }
+            ],
+            "query": {
+                "body": [{"rel": "R", "args": ["x", "y"]}],
+                "project": ["x"],
+            },
+        }
+        self.assertEqual(solve(payload), {"status": "ok", "answers": []})
+
+
+class TestAlternativesValidation(unittest.TestCase):
+    """alternatives 的非法结构 / 引用 / rank 定位（零基数组下标）。"""
+
+    def _base(self):
+        return {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                R=(2, [0, 1], [0]),
+                S=(2, [0, 1], [0]),
+            ),
+            "facts": [{"rel": "A", "args": ["a"]}],
+            "rules": [
+                {
+                    "body": [{"rel": "A", "args": ["x"]}],
+                    "alternatives": [
+                        [{"rel": "R", "args": ["x", "y"]}],
+                        [{"rel": "S", "args": ["x", "y"]}],
+                    ],
+                }
+            ],
+            "query": {
+                "body": [{"rel": "R", "args": ["x", "y"]}],
+                "project": ["x"],
+            },
+        }
+
+    def assertRejects(self, payload, path_suffix):
+        with self.assertRaises(ValidationError) as ctx:
+            solve(payload)
+        self.assertTrue(
+            ctx.exception.path.endswith(path_suffix),
+            f"路径 {ctx.exception.path!r} 应以 {path_suffix!r} 结尾",
+        )
+
+    def test_head_and_alternatives_are_mutually_exclusive(self):
+        p = self._base()
+        p["rules"][0]["head"] = {"rel": "R", "args": ["x", "y"]}
+        self.assertRejects(p, "rules[0].alternatives")
+
+    def test_rule_needs_exactly_one_conclusion(self):
+        p = self._base()
+        del p["rules"][0]["alternatives"]
+        self.assertRejects(p, "rules[0].head")
+
+    def test_alternatives_must_be_nonempty_array(self):
+        p = self._base()
+        p["rules"][0]["alternatives"] = []
+        self.assertRejects(p, "rules[0].alternatives")
+        p = self._base()
+        p["rules"][0]["alternatives"] = {"rel": "R"}
+        self.assertRejects(p, "rules[0].alternatives")
+
+    def test_alternative_must_be_nonempty_atom_array(self):
+        p = self._base()
+        p["rules"][0]["alternatives"] = [[]]
+        self.assertRejects(p, "rules[0].alternatives[0]")
+        p = self._base()
+        p["rules"][0]["alternatives"] = [{"rel": "R", "args": ["x", "y"]}]
+        self.assertRejects(p, "rules[0].alternatives[0]")
+
+    def test_unknown_relation_in_alternative(self):
+        p = self._base()
+        p["rules"][0]["alternatives"][1][0]["rel"] = "Ghost"
+        self.assertRejects(p, "rules[0].alternatives[1][0].rel")
+
+    def test_arity_mismatch_in_alternative(self):
+        p = self._base()
+        p["rules"][0]["alternatives"][0][0]["args"] = ["x"]
+        self.assertRejects(p, "rules[0].alternatives[0][0].args")
+
+    def test_non_ascii_variable_in_alternative(self):
+        p = self._base()
+        p["rules"][0]["alternatives"][0][0]["args"][1] = "变量"
+        self.assertRejects(p, "rules[0].alternatives[0][0].args[1]")
+
+    def test_existential_rank_violation_located(self):
+        p = self._base()
+        p["schema"]["R"]["ranks"] = [0, 0]
+        # y 是存在变量，落在 rank0，不高于 body 最高 rank0
+        self.assertRejects(p, "rules[0].alternatives[0][0].args[1]")
+
+    def test_shared_var_rank_violation_located(self):
+        p = self._base()
+        p["schema"]["A"]["ranks"] = [1]
+        # x 在 body 的 rank 为 1，方案中 R 首列 rank0 更低
+        self.assertRejects(p, "rules[0].alternatives[0][0].args[0]")
+
+
 class TestCLI(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="chase-accept-")
@@ -665,6 +1066,77 @@ class TestCLI(unittest.TestCase):
         )
         self.assertNotEqual(proc.returncode, 0)
         self.assertFalse(os.path.exists(self.output_path))
+
+    def test_alternatives_input_succeeds(self):
+        """原文件入口接入 alternatives：任务书析取例经 CLI 求解。"""
+        payload = {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                B=(1, [0], [0]),
+                C=(1, [0], [0]),
+                D=(1, [0], [0]),
+            ),
+            "facts": [{"rel": "A", "args": ["a"]}],
+            "rules": [
+                {
+                    "body": [{"rel": "A", "args": ["x"]}],
+                    "alternatives": [
+                        [{"rel": "B", "args": ["x"]}],
+                        [{"rel": "C", "args": ["x"]}],
+                    ],
+                },
+                {
+                    "body": [{"rel": "B", "args": ["x"]}],
+                    "head": {"rel": "D", "args": ["x"]},
+                },
+                {
+                    "body": [{"rel": "C", "args": ["x"]}],
+                    "head": {"rel": "D", "args": ["x"]},
+                },
+            ],
+            "query": {
+                "body": [{"rel": "D", "args": ["x"]}],
+                "project": ["x"],
+            },
+        }
+        self._write_input(payload)
+        proc = self._run_cli()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(self.output_path, encoding="utf-8") as fh:
+            self.assertEqual(
+                json.load(fh), {"status": "ok", "answers": [["a"]]}
+            )
+
+    def test_invalid_alternatives_keeps_old_output(self):
+        """alternatives 结构非法：整次拒绝并保留旧输出文件。"""
+        old_result = {"status": "ok", "answers": [["OLD"]]}
+        atomic_write_json(self.output_path, old_result)
+
+        bad = {
+            "schema": _schema_r(
+                A=(1, [0], [0]),
+                R=(2, [0, 1], [0]),
+            ),
+            "facts": [{"rel": "A", "args": ["a"]}],
+            "rules": [
+                {
+                    "body": [{"rel": "A", "args": ["x"]}],
+                    "alternatives": [],  # 空方案数组非法
+                }
+            ],
+            "query": {
+                "body": [{"rel": "R", "args": ["x", "y"]}],
+                "project": ["x"],
+            },
+        }
+        self._write_input(bad)
+        proc = self._run_cli()
+        self.assertNotEqual(proc.returncode, 0)
+        err = json.loads(proc.stderr)
+        self.assertTrue(err["path"].endswith("rules[0].alternatives"))
+        # 旧结果必须原封不动。
+        with open(self.output_path, encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh), old_result)
 
 
 if __name__ == "__main__":

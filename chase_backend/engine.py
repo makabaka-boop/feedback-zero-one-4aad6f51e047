@@ -1,34 +1,55 @@
-"""chase 推理引擎。
+"""chase 推理引擎（确定性 head 规则 + 析取 alternatives 规则）。
 
 语义
 ----
-规则形如 ``body -> head``：
+规则两种形态（恰选其一）：
 
-* body 的每个同态匹配都要求 head 成立；
-* head 中只在 head 出现的变量是存在变量，表示“存在某个对象”，
+* ``body -> head``：确定性规则，head 为单原子；
+* ``body -> alternatives``：析取规则，alternatives 为非空方案数组，
+  每个方案是非空原子数组、方案内原子须同时成立。每个 body 绑定至少
+  满足一个方案（允许多个同时成立，不同绑定相互独立）。
+
+变量与存在对象：
+
+* body 的每个同态匹配都要求结论成立；
+* 只在结论（head 或某方案）出现的变量是存在变量，表示“存在某个对象”，
   实现为 Skolem 空对象（匿名标识，不能作为查询答案）；
-* 同名变量取同值。
+* 同名变量取同值：方案内未在 body 出现的同名变量共享同一存在对象；
+  跨方案、跨 body 绑定的存在对象各自独立；存在对象可经键合并与其他
+  对象（含常量）相等。
 
-每个关系有键：键相同的元组所有列必须相同。当两条键相同的元组在非键列
-取值不同时，触发等值合并：
+每个关系有键：键相同的元组所有列必须相同。键相同的元组在非键列取值
+不同时触发等值合并：
 
 * 两个空对象，或空对象与常量：用并查集合并（未知对象可相等，也可等于
   某个常量）；
-* 两个不同的字符串常量：不同字符串常量永不相等，整个理论不可满足，
+* 两个不同的字符串常量：不同字符串常量永不相等，当前分支不可满足，
   抛出 :class:`InconsistentError`。
+
+析取 chase
+----------
+单分支内先把确定性规则与键合并追到不动点；随后取一个尚未满足任何
+方案的 ``(析取规则, body 绑定)``，按方案分裂子分支，每个子分支加入
+对应方案的原子（存在变量取全新空对象）再各自收敛。导致常量冲突的
+分支被丢弃——方案冲突不等于整题无解；全部分支都冲突时才不存在任何
+合法世界。
+
+每个存活分支都是一个合法世界；反过来，任意合法世界都包含某个存活
+分支的同态像（沿该世界实际满足的方案逐次选择即得对应分支路径）。
+因此“所有合法世界共有”的常量查询答案 = 各存活分支常量答案的交集。
 
 终止性
 ------
-规则的 rank 安全性保证：值只会出现在不低于其“诞生 rank”的位置，空对象
-只能在严格高于 body 最高 rank 的位置诞生。按 rank 归纳，每个 rank 层的
-对象与元组数目有限，键合并只减少不同对象数，因此 chase 必然在有限步内
-到达不动点，得到有限的通用（canonical）模型。该模型上取值为输入常量的
-查询投影，正是所有合法世界共有的必然答案。
+rank 安全（逐原子沿用：共有变量目标列 rank 不低于其 body 最高位置，
+存在变量目标列 rank 严格高于整个 body 的最高 rank）保证：值只会出现
+在不低于其“诞生 rank”的位置，空对象只能在严格高于 body 最高 rank
+的位置诞生。按 rank 归纳，每个 rank 层的对象与元组数目有限，键合并
+只减少不同对象数，故每个分支在有限步内收敛。方案一旦满足便不会被
+撤销（合并与新增元组只增不减匹配），每个 (规则, 绑定) 至多分裂一次，
+分裂点总数有限，分支树有限，整体必然终止。
 """
 
 from __future__ import annotations
-
-from typing import Optional
 
 from .errors import InconsistentError
 
@@ -94,6 +115,8 @@ class UnionFind:
 
 
 class ChaseEngine:
+    """一个 chase 分支：并查集 + 实例 + 键索引 + Skolem 缓存。"""
+
     def __init__(self, schema: dict, facts: list[dict], rules: list[dict]) -> None:
         self.schema = schema
         self.rules = rules
@@ -109,7 +132,7 @@ class ChaseEngine:
             rel: {} for rel in schema
         }
         # 规则序号 -> (共有变量绑定, Skolem 空对象 id 列表) 的缓存。
-        # 同一规则、同一共有变量取值只生成一组存在对象，保证 chase 可终止。
+        # 同一确定性规则、同一共有变量取值只生成一组存在对象，保证可终止。
         self._skolem_cache: dict[int, dict[tuple, list[int]]] = {
             i: {} for i in range(len(rules))
         }
@@ -117,6 +140,27 @@ class ChaseEngine:
         for fact in facts:
             raw = tuple(("c", c) for c in fact["args"])
             self.instance[fact["rel"]].add(raw)
+
+    # ------------------------------------------------------------------
+    # 分支拷贝
+    # ------------------------------------------------------------------
+    def clone(self) -> "ChaseEngine":
+        """深拷贝当前分支（分裂子分支用）；schema/rules 为只读共享。"""
+        other = ChaseEngine.__new__(ChaseEngine)
+        other.schema = self.schema
+        other.rules = self.rules
+        uf = UnionFind()
+        uf._parent = dict(self.uf._parent)
+        uf._constant = dict(self.uf._constant)
+        other.uf = uf
+        other._next_null = self._next_null
+        other.instance = {rel: set(tpls) for rel, tpls in self.instance.items()}
+        other.index = {rel: dict(idx) for rel, idx in self.index.items()}
+        other._skolem_cache = {
+            ri: {key: list(ids) for key, ids in cache.items()}
+            for ri, cache in self._skolem_cache.items()
+        }
+        return other
 
     # ------------------------------------------------------------------
     # 空对象
@@ -174,12 +218,14 @@ class ChaseEngine:
             self.uf.bind_constant(b[1], a[1])
 
     # ------------------------------------------------------------------
-    # 规则求值
+    # 原子匹配
     # ------------------------------------------------------------------
-    def _eval_body(self, body: list[dict]) -> list[dict[str, tuple]]:
-        """求 body 的全部同态匹配，返回变量 -> 内部值 的映射列表。"""
-        matches: list[dict[str, tuple]] = [{}]
-        for atom in body:
+    def _eval_atoms(
+        self, atoms: list[dict], initial: list[dict[str, tuple]]
+    ) -> list[dict[str, tuple]]:
+        """以 initial 为初始部分绑定，求 atoms 的全部同态匹配延拓。"""
+        matches: list[dict[str, tuple]] = [dict(b) for b in initial]
+        for atom in atoms:
             rel = atom["rel"]
             args = atom["args"]
             idx = self.index[rel]
@@ -207,6 +253,13 @@ class ChaseEngine:
                 break
         return matches
 
+    def _eval_body(self, body: list[dict]) -> list[dict[str, tuple]]:
+        """求 body 的全部同态匹配，返回变量 -> 内部值 的映射列表。"""
+        return self._eval_atoms(body, [{}])
+
+    # ------------------------------------------------------------------
+    # 确定性规则（head）
+    # ------------------------------------------------------------------
     def _insert(self, rel: str, raw_tuple: tuple) -> bool:
         """插入一条原始元组并立即做键约束检查。
 
@@ -215,8 +268,9 @@ class ChaseEngine:
 
         键冲突时**不**直接写入元组：合并可能改变当前索引条目的规范化
         代表值，就地写入会留下陈旧条目使后续规则看不到合并结果。
-        此时只执行等值合并并返回 True，由外层循环重建索引，合并后的
-        元组会在重建时自然进入索引（若仍有差异还会继续合并）。
+        此时只执行等值合并并返回 True，由外层循环重建索引；确定性规则
+        会再次触发（Skolem 缓存保证取回同一组空对象），合并后的元组
+        随重建自然进入索引（若仍有差异还会继续合并）。
         """
         canon = tuple(self.uf.canon(v) for v in raw_tuple)
         key_cols = self.schema[rel]["key"]
@@ -232,11 +286,14 @@ class ChaseEngine:
         self.index[rel][key] = canon
         return True
 
-    def _apply_rules(self) -> bool:
-        """对所有规则做一轮 chase，返回实例/等价类是否发生变化。"""
+    def _apply_deterministic(self) -> bool:
+        """对所有 head 规则做一轮 chase，返回实例/等价类是否变化。"""
         changed = False
         for rule_idx, rule in enumerate(self.rules):
-            body, head = rule["body"], rule["head"]
+            head = rule.get("head")
+            if head is None:
+                continue
+            body = rule["body"]
             head_rel = head["rel"]
             head_args = head["args"]
             body_vars = set()
@@ -273,22 +330,65 @@ class ChaseEngine:
         return changed
 
     # ------------------------------------------------------------------
+    # 析取规则（alternatives）
+    # ------------------------------------------------------------------
+    def _alternative_satisfied(self, alt: list[dict], binding: dict) -> bool:
+        """该 body 绑定下方案是否已成立（存在延拓该绑定的方案原子匹配）。"""
+        return bool(self._eval_atoms(alt, [binding]))
+
+    def next_unsatisfied_alternative(self):
+        """找一个尚未满足任何方案的 (规则序号, body 绑定)；无则返回 None。
+
+        调用前分支须已收敛（索引与并查集一致）。满足过的绑定不会被
+        撤销：键合并与新增元组只会增加匹配，不会减少。
+        """
+        for rule_idx, rule in enumerate(self.rules):
+            alts = rule.get("alternatives")
+            if alts is None:
+                continue
+            for binding in self._eval_body(rule["body"]):
+                if not any(
+                    self._alternative_satisfied(alt, binding) for alt in alts
+                ):
+                    return rule_idx, binding
+        return None
+
+    def apply_alternative(self, alt: list[dict], binding: dict) -> None:
+        """把方案原子写入实例：body 变量取绑定值；方案内未在 body 出现
+        的同名变量共享一个全新的 Skolem 空对象（跨方案、跨绑定独立）。
+
+        直接写入 instance：键合并留给 stabilize() 的索引重建完成，
+        常量冲突（若有）在子分支收敛时以 InconsistentError 暴露。
+        """
+        assigned: dict[str, int] = {}
+        for atom in alt:
+            tpl = []
+            for var in atom["args"]:
+                if var in binding:
+                    tpl.append(binding[var])
+                else:
+                    if var not in assigned:
+                        assigned[var] = self._new_null()
+                    tpl.append(("n", assigned[var]))
+            self.instance[atom["rel"]].add(tuple(tpl))
+
+    # ------------------------------------------------------------------
     # 主循环
     # ------------------------------------------------------------------
-    def run(self) -> None:
-        """执行 chase 直到不动点；不可满足时抛出 InconsistentError。"""
+    def stabilize(self) -> None:
+        """确定性规则 + 键合并追到不动点；冲突时抛出 InconsistentError。"""
         while True:
             # 先让键合并（包括级联合并）完全收敛。
             while self._rebuild_index():
                 pass
-            if not self._apply_rules():
+            if not self._apply_deterministic():
                 break
 
     # ------------------------------------------------------------------
     # 查询
     # ------------------------------------------------------------------
     def answer_query(self, query: dict) -> list[tuple[str, ...]]:
-        """在不动点模型上求必然答案。
+        """在本分支不动点模型上求查询的常量投影答案。
 
         只保留每个分量都是输入事实常量（即规范化后为 ``("c", ...)``）
         的投影元组；匿名空对象不能作为答案。按 UTF-8 字节序排序去重。
@@ -307,3 +407,29 @@ class ChaseEngine:
             if all_const:
                 results.add(tuple(out))
         return sorted(results, key=lambda t: tuple(s.encode("utf-8") for s in t))
+
+
+def chase_all(schema: dict, facts: list[dict], rules: list[dict]) -> list[ChaseEngine]:
+    """析取 chase：返回全部自洽且收敛的分支（每个都是一个合法世界）。
+
+    返回空列表表示不存在任何合法世界。某个方案选择导致冲突只丢弃
+    对应分支，不直接判整题无解。
+    """
+    final: list[ChaseEngine] = []
+    stack = [ChaseEngine(schema, facts, rules)]
+    while stack:
+        branch = stack.pop()
+        try:
+            branch.stabilize()
+        except InconsistentError:
+            continue  # 该分支不可能对应任何合法世界
+        todo = branch.next_unsatisfied_alternative()
+        if todo is None:
+            final.append(branch)
+            continue
+        rule_idx, binding = todo
+        for alt in branch.rules[rule_idx]["alternatives"]:
+            child = branch.clone()
+            child.apply_alternative(alt, binding)
+            stack.append(child)
+    return final

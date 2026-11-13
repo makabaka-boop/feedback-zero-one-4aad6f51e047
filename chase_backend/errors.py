@@ -19,4 +19,8 @@ class ValidationError(ChaseError):
 
 
 class InconsistentError(ChaseError):
-    """不存在任何合法世界（键约束导致两个不同常量必须相等）。"""
+    """当前 chase 分支不可满足（键约束要求两个不同常量相等）。
+
+    单个分支冲突只排除该分支；所有分支都冲突时才不存在任何合法世界，
+    由上层汇总后输出 ``inconsistent``。
+    """

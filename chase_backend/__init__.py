@@ -1,4 +1,4 @@
-"""后端交换作业：带键约束与存在量词规则的 chase 推理后端。
+"""后端交换作业：带键约束、存在量词与析取方案规则的 chase 推理后端。
 
 对外主入口为 :func:`chase_backend.solve`，命令行入口见
 ``python -m chase_backend``。

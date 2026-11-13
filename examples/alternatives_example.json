@@ -1,0 +1,32 @@
+{
+  "schema": {
+    "A": {"arity": 1, "ranks": [0], "key": [0]},
+    "B": {"arity": 1, "ranks": [0], "key": [0]},
+    "C": {"arity": 1, "ranks": [0], "key": [0]},
+    "D": {"arity": 1, "ranks": [0], "key": [0]}
+  },
+  "facts": [
+    {"rel": "A", "args": ["a"]}
+  ],
+  "rules": [
+    {
+      "body": [{"rel": "A", "args": ["x"]}],
+      "alternatives": [
+        [{"rel": "B", "args": ["x"]}],
+        [{"rel": "C", "args": ["x"]}]
+      ]
+    },
+    {
+      "body": [{"rel": "B", "args": ["x"]}],
+      "head": {"rel": "D", "args": ["x"]}
+    },
+    {
+      "body": [{"rel": "C", "args": ["x"]}],
+      "head": {"rel": "D", "args": ["x"]}
+    }
+  ],
+  "query": {
+    "body": [{"rel": "D", "args": ["x"]}],
+    "project": ["x"]
+  }
+}
